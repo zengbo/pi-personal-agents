@@ -3,10 +3,12 @@ import type { Models } from "@earendil-works/pi-ai";
 import {
   AssistantEntry,
   DEFAULT_COMPACTION_POLICY,
+  DEFAULT_RETRY_POLICY,
   Harness,
   createRegistry,
   type CompactionPolicy,
   type Conversation,
+  type ConversationRetryPolicy,
   type ConversationId,
   type ConversationView,
   type Registry,
@@ -45,13 +47,24 @@ export interface ControllerOptions {
   readonly trace?: string[];
   /** Merged over pi-durable's built-in compaction policy. Tests lower the thresholds. */
   readonly compaction?: Partial<CompactionPolicy>;
+  /** Merged over pi-durable's built-in model-call retry. Tests shorten the delay. */
+  readonly retry?: Partial<ConversationRetryPolicy>;
   /** Test hook. Fired once each harness is open, before extensions are installed. */
   readonly onHarness?: (bot: BotName, harness: Harness) => void;
 }
 
-/** Built-in pi-durable compaction, with an optional test override. Retry stays off. */
+/** Built-in pi-durable compaction, with an optional test override. */
 export function controllerCompaction(override?: Partial<CompactionPolicy>): CompactionPolicy {
   return { ...DEFAULT_COMPACTION_POLICY, ...override };
+}
+
+/**
+ * Built-in pi-durable model-call retry.
+ * `retryDelayMs` waits `min(baseDelayMs * 2^(attempt-1), maxAgentDelayMs)`.
+ * pi-ai 1.1.0 does not add a random term on top of that delay.
+ */
+export function controllerRetry(override?: Partial<ConversationRetryPolicy>): ConversationRetryPolicy {
+  return { ...DEFAULT_RETRY_POLICY, ...override };
 }
 
 export interface RunningController {
@@ -85,7 +98,7 @@ export async function startController(options: ControllerOptions): Promise<Runni
           registry,
           settings: {
             compaction: controllerCompaction(options.compaction),
-            retry: { enabled: false, maxRetries: 0, baseDelayMs: 0 },
+            retry: controllerRetry(options.retry),
           },
           env: async (target) => {
             const session = sanitizeSession(String(target.conversationId));
@@ -284,24 +297,25 @@ function project(view: ConversationView): ViewEntry[] {
   }));
 }
 
-function texts(model: readonly { content?: unknown }[] | undefined): string {
+function texts(model: readonly { content?: unknown; errorMessage?: unknown }[] | undefined): string {
   if (model === undefined) {
     return "";
   }
   const parts: string[] = [];
   for (const message of model) {
+    const before = parts.length;
     const content = message.content;
     if (typeof content === "string") {
       parts.push(content);
-      continue;
-    }
-    if (!Array.isArray(content)) {
-      continue;
-    }
-    for (const part of content) {
-      if (typeof part === "object" && part !== null && "type" in part && part.type === "text" && "text" in part && typeof part.text === "string") {
-        parts.push(part.text);
+    } else if (Array.isArray(content)) {
+      for (const part of content) {
+        if (typeof part === "object" && part !== null && "type" in part && part.type === "text" && "text" in part && typeof part.text === "string") {
+          parts.push(part.text);
+        }
       }
+    }
+    if (parts.length === before && typeof message.errorMessage === "string" && message.errorMessage.length > 0) {
+      parts.push(message.errorMessage);
     }
   }
   return parts.join("");

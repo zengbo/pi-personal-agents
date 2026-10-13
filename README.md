@@ -25,7 +25,7 @@
 
 ## 状态
 
-Phase 0 已合并（`39774a1`）。Phase 1（controller、Web、三个 bot、Podman 沙箱、审批）已合并到 main（`f50f652`）。上下文压缩已合并（`a4d56ca`）。生产沙箱只启动 crun；会话叶子由 sbx 的 helper 创建（`0700`）。retry 仍关闭，待确认。部署步骤见 [docs/deployment.md](docs/deployment.md)。设计文档仍是规格；VPS 上的 48 项环境测试不在 CI 里重跑，也不从这里登录 `racknerd_us`。
+Phase 0 已合并（`39774a1`）。Phase 1（controller、Web、三个 bot、Podman 沙箱、审批）已合并到 main（`f50f652`）。上下文压缩已合并（`a4d56ca`）。生产沙箱只启动 crun；会话叶子由 sbx 的 helper 创建（`0700`）。模型请求重试使用 pi-durable 的内置策略（最多 3 次，只重发模型请求）。部署步骤见 [docs/deployment.md](docs/deployment.md)。设计文档仍是规格；VPS 上的 48 项环境测试不在 CI 里重跑，也不从这里登录 `racknerd_us`。
 
 ## 依赖版本（精确锁定）
 

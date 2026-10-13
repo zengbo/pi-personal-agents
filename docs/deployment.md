@@ -374,4 +374,4 @@ cloudflared 自身的日志用它的系统单元看（常见是 `journalctl -u c
 
 叶子由 `User=sbx` 的 socket 激活服务创建，模式 `0700`，属主 `sbx`。校验是 openat，拒绝 `..` 和符号链接。agentctl 只发请求。父目录保持 sbx `0750` 加 agentctl 的 `r`/`x` ACL。安装步骤在第 2.1 节。会话文件的读写在容器内 exec 完成，agentctl 不在宿主上打开叶子，叶子权限和 ACL 都不改。
 
-retry 仍是 `{ enabled: false, maxRetries: 0, baseDelayMs: 0 }`，这项还待确认，和上面两件无关。
+模型请求重试已开启，没有新的环境变量。策略是 pi-durable 1.1.0 的 `DEFAULT_RETRY_POLICY`：最多再请求 3 次，间隔 2 秒、4 秒、8 秒，单次不超过 60 秒。只重发模型请求。网络、429、5xx、overloaded 会等；认证失败和 4xx 校验错误不会等。三次仍失败时，对话里能看到模型的错误文本。见 [docs/follow-ups.md](follow-ups.md)。

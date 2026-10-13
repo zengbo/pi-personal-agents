@@ -1,6 +1,6 @@
 # 后续
 
-Phase 1 评审时记下的后续。沙箱边界保持原样。上下文压缩已经用 pi-durable 的内置策略做完。主人接受继续搁置的是：ops 的 exec 可以绕过 `git_push` 审批，以及会话列表只有 root。retry 仍关闭，这项待确认。原先两个部署阻塞项已经按文末的选择解决。
+Phase 1 评审时记下的后续。沙箱边界保持原样。上下文压缩和模型请求重试都用 pi-durable 1.1.0 的内置策略。主人接受继续搁置的是：ops 的 exec 可以绕过 `git_push` 审批，以及会话列表只有 root。原先两个部署阻塞项已经按文末的选择解决。
 
 ## ops 的 exec 可以绕过 git_push
 
@@ -12,9 +12,15 @@ Phase 1 评审时记下的后续。沙箱边界保持原样。上下文压缩已
 
 崩溃恢复沿用原来的 replay 规则：`exec` 是 unsafe，压缩之后杀掉进程也不会把同一次 exec 再跑一遍。测试把阈值和 faux 的 `contextWindow` 调低，生产路径仍是上面的默认策略。
 
-## retry 仍然关闭（待确认）
+## 模型请求重试已开启
 
-这项还没有主人确认。当前 `retry` 是 `{ enabled: false, maxRetries: 0, baseDelayMs: 0 }`。模型失败不会自动再请求。
+主人已确认开启。`startController` 使用 pi-durable 1.1.0 的内置策略 `DEFAULT_RETRY_POLICY`（`enabled: true`，`maxRetries: 3`，`baseDelayMs: 2000`，`maxAgentDelayMs: 60000`）。这只重发模型请求。工具不会因为这次重试再执行，危险工具也不会再弹一张审批卡。
+
+会重试的是瞬时错误：网络失败、429、5xx、overloaded。认证失败、4xx 校验错误、配额或账单用尽（例如 `insufficient_quota`）立刻失败，不再请求。上下文溢出也不走这条重试，仍交给压缩。
+
+等待时间是 `min(baseDelayMs * 2^(attempt-1), maxAgentDelayMs)`，也就是 2 秒、4 秒、8 秒，封顶 60 秒。pi-ai 1.1.0 的 `retryDelayMs` 没有在这个数上再加随机抖动；类型注释里的 “before jitter” 没有对应实现。不另写一套重试，退避截止时间写在 generation 的 checkpoint 里。崩溃发生在等待期间时，恢复后继续睡到同一个 `until`，然后只重发模型请求。三次重试仍失败时，提交以 `model_error` 结束，`detail` 是模型返回的错误文本，对话视图里也能看到这句。
+
+没有新增环境变量。和压缩一起用：压缩仍按 `DEFAULT_COMPACTION_POLICY`，审批仍在 `policy.sqlite`。
 
 ## 会话列表只有 root
 
