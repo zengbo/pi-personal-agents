@@ -117,7 +117,9 @@ describe("web guards", () => {
     };
     access.refreshKeys = async () => {
       const result = await cache.refetchForUnknownKid();
-      access.keys = [...result.keys];
+      if (result.fetched) {
+        access.keys = [...result.keys];
+      }
       return result.fetched;
     };
     const web = await listen({ access });
@@ -127,6 +129,36 @@ describe("web guards", () => {
     keys = [{ kid: "later", key: publicKey }];
     const blocked = await httpCall(web.port, "GET", "/api/bots", { token: token({}, [], "other") });
     expect(blocked.status).toBe(401);
+    expect(loads).toBe(1);
+  });
+
+  it("returns 401 when an unknown-kid refetch throws and keeps serving", async () => {
+    let loads = 0;
+    const cache = new JwksCache(async () => {
+      loads += 1;
+      throw new Error("access jwks request failed");
+    });
+    const access = {
+      audience: "test-aud",
+      issuer,
+      ownerEmail,
+      origin: "https://chat.example.com",
+      keys: [{ kid: "test", key: publicKey }],
+      refreshKeys: async () => false,
+    };
+    access.refreshKeys = async () => {
+      const result = await cache.refetchForUnknownKid();
+      if (result.fetched) {
+        access.keys = [...result.keys];
+      }
+      return result.fetched;
+    };
+    const web = await listen({ access });
+    const denied = await httpCall(web.port, "GET", "/api/bots", { token: token({}, [], "missing") });
+    expect(denied.status).toBe(401);
+    await expect(openTestSocket(web.port, token({}, [], "missing"))).rejects.toThrow(/401/);
+    const ok = await httpCall(web.port, "GET", "/api/bots", { token: token() });
+    expect(ok.status).toBe(200);
     expect(loads).toBe(1);
   });
 

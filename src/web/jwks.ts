@@ -45,7 +45,7 @@ export class JwksCache {
 
   start(): () => void {
     return this.schedule(this.intervalMs, () => {
-      void this.refresh(true);
+      void this.refresh(true).catch(() => undefined);
     });
   }
 
@@ -54,13 +54,28 @@ export class JwksCache {
     if (!force && now - this.lastFetch < this.minRefetchMs) {
       return { fetched: false, keys: this.keys };
     }
+    // Count the attempt before load so a failure still starts the rate-limit window.
     this.lastFetch = now;
-    const keys = await this.load();
-    this.keys = [...keys];
-    return { fetched: true, keys: this.keys };
+    try {
+      const keys = await this.load();
+      this.keys = [...keys];
+      return { fetched: true, keys: this.keys };
+    } catch (error) {
+      logJwksFailure(error);
+      throw error;
+    }
   }
 
   refetchForUnknownKid(): Promise<{ fetched: boolean; keys: readonly AccessKey[] }> {
     return this.refresh(false);
   }
+}
+
+const JWKS_LOG_MESSAGES = new Set(["access jwks request failed", "access jwks had no rsa keys"]);
+
+/** stderr only. Anything other than the fixed load errors is replaced, so tokens and URLs stay out. */
+function logJwksFailure(error: unknown): void {
+  const raw = error instanceof Error ? error.message : "";
+  const safe = JWKS_LOG_MESSAGES.has(raw) ? raw : "request failed";
+  process.stderr.write(`jwks refresh failed: ${safe}\n`);
 }

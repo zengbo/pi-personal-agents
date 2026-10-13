@@ -23,7 +23,7 @@ Phase 0 的规格仍以 `docs/design.md` 与 `docs/implementation-plan.md` 为�
 | 变量 | 作用 |
 |---|---|
 | `CLOUDFLARE_ACCESS_AUD` | JWT `aud`，必填 |
-| `CLOUDFLARE_ACCESS_JWKS_URL` | RS256 JWKS，必填。启动时拉取，之后每 10 分钟刷新；未知 `kid` 再拉一次，两次至少隔 30 秒 |
+| `CLOUDFLARE_ACCESS_JWKS_URL` | RS256 JWKS，必填。启动时拉取，失败则进程退出。之后每 10 分钟刷新；未知 `kid` 再拉一次，两次至少隔 30 秒。刷新失败保留已有密钥并记一行不含 token 的日志，不让未处理的 rejection 退出进程。未知 `kid` 再拉失败仍是 401 |
 | `CLOUDFLARE_ACCESS_TEAM_DOMAIN` | 必填，拼成 `iss`（`https://<domain>`），每次都校验 |
 | `CLOUDFLARED_HOSTNAME` | 必填。POST 和 WebSocket 的 `Origin` 必须等于 `https://<hostname>` |
 | `PPA_OWNER_EMAIL` | 必填。JWT `email` 必须与它完全一致，审批人只记这个邮箱 |

@@ -54,7 +54,9 @@ export async function startWeb(app: WebApp, options: { host?: string; port: numb
     });
   });
   server.on("upgrade", (request, socket, head) => {
-    void acceptUpgrade(app, request, socket, head);
+    void acceptUpgrade(app, request, socket, head).catch(() => {
+      failUpgrade(socket);
+    });
   });
   await new Promise<void>((resolve) => {
     server.listen(options.port, host, () => resolve());
@@ -119,13 +121,13 @@ async function authorize(
     return verifyAccessJwt(token, app.access);
   } catch (error) {
     if (error instanceof AccessError && error.reason === "kid" && app.access.refreshKeys !== undefined) {
-      const fetched = await app.access.refreshKeys();
-      if (fetched) {
-        try {
+      try {
+        const fetched = await app.access.refreshKeys();
+        if (fetched) {
           return verifyAccessJwt(token, app.access);
-        } catch {
-          return undefined;
         }
+      } catch {
+        return undefined;
       }
     }
     return undefined;
@@ -307,4 +309,11 @@ function parseObject(text: string): Record<string, unknown> | undefined {
 
 function one(value: string | string[] | undefined): string | undefined {
   return Array.isArray(value) ? value[0] : value;
+}
+
+function failUpgrade(socket: Duplex): void {
+  if (!socket.destroyed && socket.writable) {
+    socket.write("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+  }
+  socket.destroy();
 }

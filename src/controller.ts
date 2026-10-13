@@ -41,7 +41,9 @@ async function main(): Promise<void> {
   access.keys = [...(await jwks.refresh(true)).keys];
   access.refreshKeys = async () => {
     const result = await jwks.refetchForUnknownKid();
-    access.keys = [...result.keys];
+    if (result.fetched) {
+      access.keys = [...result.keys];
+    }
     return result.fetched;
   };
   jwks.start();
@@ -90,7 +92,12 @@ function sbxRunner(): CommandRunner {
 }
 
 async function loadJwks(url: string): Promise<AccessKey[]> {
-  const response = await fetch(url);
+  let response: Response;
+  try {
+    response = await fetch(url);
+  } catch {
+    throw new Error("access jwks request failed");
+  }
   if (!response.ok) {
     throw new Error("access jwks request failed");
   }
