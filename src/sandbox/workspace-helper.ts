@@ -469,18 +469,24 @@ function askHelper(socketPath: string, bot: string, session: string): Promise<{ 
 }
 
 /**
- * sd_listen_fds(3): fd 3 is the socket only when LISTEN_FDS=1 and LISTEN_PID
- * is unset or equal to this process. A mismatched LISTEN_PID is not our socket.
+ * sd_listen_fds(3): fd 3 is our socket only when LISTEN_FDS=1 and LISTEN_PID
+ * is present and equal to this process. Unset or foreign LISTEN_PID is not ours.
+ * The three LISTEN_* variables are cleared before returning.
  */
 export function systemdListenFd(): number | undefined {
-  if (process.env.LISTEN_FDS !== "1") {
-    return undefined;
-  }
-  const listenPid = process.env.LISTEN_PID;
-  if (listenPid !== undefined && listenPid !== String(process.pid)) {
+  const fds = process.env.LISTEN_FDS;
+  const pid = process.env.LISTEN_PID;
+  clearSystemdListenEnv();
+  if (fds !== "1" || pid !== String(process.pid)) {
     return undefined;
   }
   return 3;
+}
+
+function clearSystemdListenEnv(): void {
+  delete process.env.LISTEN_FDS;
+  delete process.env.LISTEN_PID;
+  delete process.env.LISTEN_FDNAMES;
 }
 
 function flag(name: string): string | undefined {
@@ -507,9 +513,7 @@ if (invokedDirectly()) {
   const root = flag("--root") ?? process.env.PPA_WORKSPACE_ROOT ?? "/home/sbx/workspaces";
   const socketPath = flag("--socket");
   const fd = socketPath === undefined ? systemdListenFd() : undefined;
-  delete process.env.LISTEN_FDS;
-  delete process.env.LISTEN_PID;
-  delete process.env.LISTEN_FDNAMES;
+  clearSystemdListenEnv();
   void startWorkspaceHelper({ root, socketPath, fd }).catch(() => {
     process.stderr.write("workspace helper failed\n");
     process.exitCode = 1;

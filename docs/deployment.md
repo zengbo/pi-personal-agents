@@ -55,7 +55,7 @@ done
 
 叶子不在这里创建。下面第 2.1 节的 helper 收到请求后才建 `<session>`，模式 `0700`。不要把 `/home/agentctl`、Podman socket 或 secrets 挂进容器。
 
-crun 的 `--userns keep-id:uid=1000,gid=1000` 在 sbx 的 rootless Podman 里把容器 uid 1000 映到宿主 `sbx`。`0700` 且属主是 `sbx` 的叶子，容器进程能读写。叶子保持 `0700`，不加 ACL，也不改成 `0777`。`SandboxExecutionEnv` 的文件操作在容器里经 exec 完成（`cat --`、stdin 上的 `tee`、`ls` / `stat` / `mv`）。路径限制在 `/workspace`，拒绝 `..` 和越出 `/workspace` 的绝对路径，并用 `realpath` 确认目标落在 `/workspace` 下面。agentctl 不在宿主上打开叶子。
+crun 的 `--userns keep-id:uid=1000,gid=1000` 在 sbx 的 rootless Podman 里把容器 uid 1000 映到宿主 `sbx`。`0700` 且属主是 `sbx` 的叶子，容器进程能读写。叶子保持 `0700`，不加 ACL，也不改成 `0777`。`SandboxExecutionEnv` 的文件操作在容器里经 exec 完成（不超过 8 MiB 的 `head -c`、原始 stdin 上的 `tee`、`find` / `stat` / `mv`）。路径限制在 `/workspace`，拒绝 `..` 和越出 `/workspace` 的绝对路径，并用 `realpath` 确认目标落在 `/workspace` 下面。单次读写超过 `MAX_FILE_BYTES`（8 MiB）时返回 `too_large`，不把超出的字节交回去。agentctl 不在宿主上打开叶子。hijack 协议里只有输出带 8 字节帧头，stdin 是原始字节，写完后 `socket.end()` 半关。
 
 ### 2.1 会话叶子 helper
 
@@ -274,6 +274,48 @@ controller 进程里没有 `runuser`，也没有 `systemctl set-property`。crun
 重新启用 runsc 要先有一条不经过 agentctl `runuser` 的 set-property 路径，并且在 start 之前加上 `MemoryMax=768M`、`TasksMax=256`、`CPUQuota=100%`（`RUNSC_SCOPE_PROPERTIES`）。在那之前 runsc 不可选。见第 12 节。
 
 同时看第 4 节，确认镜像里有 `bash` 和 `sleep`。
+
+### 9.1 核对 write_file 的二进制 stdin
+
+`write_file` 把字节从 exec 的 stdin 交给容器里的 `tee`。确认容器里的文件和宿主上准备的字节逐字节相同：比较两边的 sha256。不要在宿主上对 `0700` 叶子做 `sha256sum`，agentctl 打不开它。
+
+`write_file` 工具的 `content` 是字符串，按 UTF-8 编码，`0xff` 不能靠这个字符串保住。下面这段用 `Uint8Array` 走 `UnixPodmanClient.exec`，和 `SandboxExecutionEnv.writeFile` 写给 `tee` 的 stdin 是同一条路：原始字节，没有 8 字节 multiplex 头。容器需要已经在跑。`$id` 用 `podman ps` 里该会话的容器 id。
+
+```bash
+python3 - <<'PY'
+from pathlib import Path
+import hashlib
+payload = bytes([0x00, 0xff, 0x41, 0x0a, 0x00])
+Path("/tmp/ppa-bin.dat").write_bytes(payload)
+print(hashlib.sha256(payload).hexdigest())
+PY
+
+id=$(podman --url unix:///run/sbx/podman.sock ps -q | head -n 1)
+test -n "$id"
+cd /home/agentctl/app
+export PATH="$HOME/.nvm/versions/node/v22.23.3/bin:$PATH"
+PPA_BIN_CHECK_ID="$id" node --experimental-strip-types --input-type=module --eval '
+import { readFileSync } from "node:fs";
+import { UnixPodmanClient } from "./src/sandbox/podman.ts";
+const id = process.env.PPA_BIN_CHECK_ID ?? "";
+if (id.length === 0) {
+  process.stderr.write("missing container id\n");
+  process.exit(1);
+}
+const stdin = new Uint8Array(readFileSync("/tmp/ppa-bin.dat"));
+const client = new UnixPodmanClient({ crun: "/run/sbx/podman.sock" });
+const result = await client.exec("crun", id, ["tee", "--", "/workspace/bin.dat"], { stdin, cwd: "/workspace" });
+if (result.exitCode !== 0) {
+  process.stderr.write(result.stderr + "\n");
+  process.exit(1);
+}
+'
+podman --url unix:///run/sbx/podman.sock exec "$id" sha256sum /workspace/bin.dat
+podman --url unix:///run/sbx/podman.sock exec "$id" rm -f /workspace/bin.dat
+rm -f /tmp/ppa-bin.dat
+```
+
+上面 python 打印的摘要必须和容器里 `sha256sum` 的第一列相同。若 stdin 被加上 multiplex 头，容器里的文件会多出 8 字节，摘要对不上。样本只有几字节；超过 8 MiB 的写入会在 exec 之前被拒绝。
 
 ## 10. 升级与回滚
 

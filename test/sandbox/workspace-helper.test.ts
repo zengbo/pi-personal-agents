@@ -205,26 +205,48 @@ describe("sbx workspace helper", () => {
     expect(refuseDisabledRuntime("crun")).toBeUndefined();
   });
 
-  it("accepts the listen fd only when LISTEN_PID is unset or this process", () => {
+  it("requires LISTEN_PID to match this process and then clears the listen environment", () => {
     const previousFds = process.env.LISTEN_FDS;
     const previousPid = process.env.LISTEN_PID;
+    const previousNames = process.env.LISTEN_FDNAMES;
     try {
       delete process.env.LISTEN_FDS;
       delete process.env.LISTEN_PID;
+      delete process.env.LISTEN_FDNAMES;
       expect(systemdListenFd()).toBeUndefined();
+
       process.env.LISTEN_FDS = "1";
       delete process.env.LISTEN_PID;
-      expect(systemdListenFd()).toBe(3);
-      process.env.LISTEN_PID = String(process.pid);
-      expect(systemdListenFd()).toBe(3);
-      process.env.LISTEN_PID = String(process.pid + 1);
+      process.env.LISTEN_FDNAMES = "socket";
       expect(systemdListenFd()).toBeUndefined();
+      expect(process.env.LISTEN_FDS).toBeUndefined();
+      expect(process.env.LISTEN_PID).toBeUndefined();
+      expect(process.env.LISTEN_FDNAMES).toBeUndefined();
+
+      process.env.LISTEN_FDS = "1";
+      process.env.LISTEN_PID = String(process.pid + 1);
+      process.env.LISTEN_FDNAMES = "socket";
+      expect(systemdListenFd()).toBeUndefined();
+      expect(process.env.LISTEN_FDS).toBeUndefined();
+      expect(process.env.LISTEN_PID).toBeUndefined();
+      expect(process.env.LISTEN_FDNAMES).toBeUndefined();
+
+      process.env.LISTEN_FDS = "1";
+      process.env.LISTEN_PID = String(process.pid);
+      process.env.LISTEN_FDNAMES = "socket";
+      expect(systemdListenFd()).toBe(3);
+      expect(process.env.LISTEN_FDS).toBeUndefined();
+      expect(process.env.LISTEN_PID).toBeUndefined();
+      expect(process.env.LISTEN_FDNAMES).toBeUndefined();
+
       process.env.LISTEN_FDS = "2";
       process.env.LISTEN_PID = String(process.pid);
       expect(systemdListenFd()).toBeUndefined();
+      expect(process.env.LISTEN_FDS).toBeUndefined();
     } finally {
       restoreEnv("LISTEN_FDS", previousFds);
       restoreEnv("LISTEN_PID", previousPid);
+      restoreEnv("LISTEN_FDNAMES", previousNames);
     }
   });
 });
@@ -247,7 +269,7 @@ function rawRequest(socketPath: string, body: { bot: string; session: string }):
   });
 }
 
-function restoreEnv(name: "LISTEN_FDS" | "LISTEN_PID", value: string | undefined): void {
+function restoreEnv(name: "LISTEN_FDS" | "LISTEN_PID" | "LISTEN_FDNAMES", value: string | undefined): void {
   if (value === undefined) {
     delete process.env[name];
     return;

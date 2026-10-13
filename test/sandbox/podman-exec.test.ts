@@ -3,7 +3,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { demuxPodmanFrameBuffers, muxPodmanFrame, UnixPodmanClient } from "../../src/sandbox/podman.ts";
+import { MAX_FILE_BYTES } from "../../src/sandbox/flags.ts";
+import { muxPodmanFrame, PodmanOutputTooLargeError, UnixPodmanClient } from "../../src/sandbox/podman.ts";
 
 describe("podman exec stdin", () => {
   it("reads a normal exec body when the server does not upgrade", async () => {
@@ -30,9 +31,11 @@ describe("podman exec stdin", () => {
     }
   });
 
-  it("writes stdin frames on the upgraded socket and keeps stdout bytes", async () => {
+  it("writes raw stdin bytes on the upgraded socket", async () => {
+    const stdin = Buffer.from([0x00, 0xff, 0x09, 0x0a, 0x41, 0x00]);
     let seen = Buffer.alloc(0);
     const server = await listen(undefined, (req, socket, head) => {
+      socket.on("error", () => undefined);
       socket.write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: tcp\r\nConnection: Upgrade\r\n\r\n");
       const declared = Number(req.headers["content-length"] ?? 0);
       const chunks: Buffer[] = [];
@@ -44,20 +47,71 @@ describe("podman exec stdin", () => {
       });
       socket.on("end", () => {
         seen = Buffer.concat(chunks);
-        const payload = Buffer.from([0xff, 0x00, 0x41]);
-        socket.write(muxPodmanFrame(1, payload));
+        socket.write(muxPodmanFrame(1, Buffer.from([0xff, 0x00, 0x41])));
         socket.end();
       });
     });
     try {
       const client = new UnixPodmanClient({ crun: server.socketPath });
-      const result = await client.exec("crun", "ctr", ["tee", "--", "/workspace/note.txt"], {
-        stdin: new Uint8Array([9, 8, 7]),
-      });
+      const result = await client.exec("crun", "ctr", ["tee", "--", "/workspace/note.txt"], { stdin });
       expect(result.exitCode).toBe(0);
       expect([...(result.stdoutBytes ?? [])]).toEqual([0xff, 0x00, 0x41]);
-      const frames = demuxPodmanFrameBuffers(seen);
-      expect([...frames.stdout]).toEqual([9, 8, 7]);
+      expect(Buffer.compare(seen, stdin)).toBe(0);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("accepts one multiplexed stdout frame of exactly MAX_FILE_BYTES", async () => {
+    const payload = Buffer.alloc(MAX_FILE_BYTES, 0x61);
+    const server = await listen(undefined, (_req, socket) => {
+      socket.on("error", () => undefined);
+      socket.write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: tcp\r\nConnection: Upgrade\r\n\r\n");
+      const frame = muxPodmanFrame(1, payload);
+      socket.write(frame.subarray(0, 8));
+      socket.write(frame.subarray(8));
+      socket.end();
+    });
+    try {
+      const client = new UnixPodmanClient({ crun: server.socketPath });
+      const result = await client.exec("crun", "ctr", "true", undefined);
+      expect(result.exitCode).toBe(0);
+      expect(result.stdoutBytes?.byteLength).toBe(MAX_FILE_BYTES);
+      expect(result.stdoutBytes?.[0]).toBe(0x61);
+      expect(result.stdoutBytes?.[MAX_FILE_BYTES - 1]).toBe(0x61);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("aborts when multiplexed stdout exceeds MAX_FILE_BYTES", async () => {
+    const server = await listen(undefined, (_req, socket) => {
+      socket.on("error", () => undefined);
+      socket.write("HTTP/1.1 101 Switching Protocols\r\nUpgrade: tcp\r\nConnection: Upgrade\r\n\r\n");
+      socket.write(muxPodmanFrame(1, Buffer.alloc(MAX_FILE_BYTES + 1, 0x7a)));
+      socket.end();
+    });
+    try {
+      const client = new UnixPodmanClient({ crun: server.socketPath });
+      const error = await client.exec("crun", "ctr", "true", undefined).then(
+        () => undefined,
+        (caught: unknown) => caught,
+      );
+      expect(error).toBeInstanceOf(PodmanOutputTooLargeError);
+      expect(error instanceof Error ? error.message : "").toBe("too_large");
+      expect(JSON.stringify(error)).not.toContain("z".repeat(32));
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("aborts a non-upgraded body larger than MAX_FILE_BYTES", async () => {
+    const server = await listen((_req, res) => {
+      res.end(muxPodmanFrame(1, Buffer.alloc(MAX_FILE_BYTES + 1, 0x7a)));
+    });
+    try {
+      const client = new UnixPodmanClient({ crun: server.socketPath });
+      await expect(client.exec("crun", "ctr", "true", undefined)).rejects.toBeInstanceOf(PodmanOutputTooLargeError);
     } finally {
       await server.close();
     }

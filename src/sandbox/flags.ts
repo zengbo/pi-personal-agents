@@ -7,6 +7,8 @@ export const SANDBOX_MEMORY_BYTES = 768 * 1024 * 1024;
 export const SANDBOX_PIDS_LIMIT = 256;
 export const SANDBOX_CPU_PERIOD = 100_000;
 export const SANDBOX_CPU_QUOTA = 100_000;
+/** One read, write, or exec stream. Larger payloads are rejected and not returned. */
+export const MAX_FILE_BYTES = 8 * 1024 * 1024;
 
 export const SANDBOX_PROXY_ENV = {
   HTTP_PROXY: SANDBOX_PROXY,

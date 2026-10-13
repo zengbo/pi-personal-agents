@@ -1,8 +1,17 @@
 import http from "node:http";
+import { MAX_FILE_BYTES } from "./flags.ts";
 import type { SandboxDriver, SandboxSession } from "./pool.ts";
 import { RUNSC_DISABLED_MESSAGE } from "./runtime-guard.ts";
 import { buildSandboxSpec, specKeepsSandbox, type SandboxSpec } from "./spec.ts";
 import type { RuntimeKind } from "./pool.ts";
+
+/** Hijack output grew past MAX_FILE_BYTES. The extra bytes are not returned. */
+export class PodmanOutputTooLargeError extends Error {
+  constructor() {
+    super("too_large");
+    this.name = "PodmanOutputTooLargeError";
+  }
+}
 
 export interface PodmanExecResult {
   readonly exitCode: number;
@@ -99,7 +108,7 @@ export function demuxPodmanFrames(buffer: Buffer): { stdout: string; stderr: str
   };
 }
 
-/** One stdin frame. Callers chunk large payloads before sending. */
+/** One multiplexed output frame: stream byte, three zero bytes, uint32 BE length. */
 export function muxPodmanFrame(stream: number, payload: Buffer): Buffer {
   const header = Buffer.alloc(8);
   header[0] = stream & 0xff;
@@ -107,16 +116,91 @@ export function muxPodmanFrame(stream: number, payload: Buffer): Buffer {
   return Buffer.concat([header, payload]);
 }
 
-function muxStdinFrames(payload: Buffer): Buffer {
-  if (payload.length === 0) {
-    return Buffer.alloc(0);
+/**
+ * Multiplexed stdout/stderr. A frame bigger than MAX_FILE_BYTES is rejected
+ * before its body is kept. Payload (not the 8-byte headers) past the cap is too.
+ */
+class CappedFrames {
+  private readonly parts: Buffer[] = [];
+  private header = Buffer.alloc(0);
+  private remaining: number | undefined;
+  private payload = 0;
+  private retained = 0;
+
+  push(chunk: Buffer): void {
+    let offset = 0;
+    while (offset < chunk.length) {
+      if (this.remaining === undefined) {
+        const need = 8 - this.header.length;
+        const take = Math.min(need, chunk.length - offset);
+        const next = Buffer.alloc(this.header.length + take);
+        this.header.copy(next, 0);
+        chunk.copy(next, this.header.length, offset, offset + take);
+        this.header = next;
+        offset += take;
+        if (this.header.length < 8) {
+          return;
+        }
+        const size = this.header.readUInt32BE(4);
+        if (size > MAX_FILE_BYTES || this.payload + size > MAX_FILE_BYTES) {
+          this.header = Buffer.alloc(0);
+          throw new PodmanOutputTooLargeError();
+        }
+        this.keep(this.header);
+        this.payload += size;
+        this.remaining = size;
+        this.header = Buffer.alloc(0);
+        continue;
+      }
+      if (this.remaining === 0) {
+        this.remaining = undefined;
+        continue;
+      }
+      const take = Math.min(this.remaining, chunk.length - offset);
+      const piece = Buffer.alloc(take);
+      chunk.copy(piece, 0, offset, offset + take);
+      this.keep(piece);
+      offset += take;
+      this.remaining -= take;
+      if (this.remaining === 0) {
+        this.remaining = undefined;
+      }
+    }
   }
-  const frames: Buffer[] = [];
-  const chunkSize = 64 * 1024;
-  for (let offset = 0; offset < payload.length; offset += chunkSize) {
-    frames.push(muxPodmanFrame(0, payload.subarray(offset, Math.min(payload.length, offset + chunkSize))));
+
+  concat(): Buffer {
+    if (this.header.length > 0) {
+      this.parts.push(this.header);
+      this.header = Buffer.alloc(0);
+    }
+    return Buffer.concat(this.parts);
   }
-  return Buffer.concat(frames);
+
+  private keep(piece: Buffer): void {
+    this.retained += piece.length;
+    if (this.retained > MAX_FILE_BYTES + 4096) {
+      throw new PodmanOutputTooLargeError();
+    }
+    this.parts.push(piece);
+  }
+}
+
+function takeFrames(
+  frames: CappedFrames,
+  chunk: Buffer,
+  destroy: () => void,
+  fail: (error: unknown) => void,
+  settled: () => boolean,
+): void {
+  if (settled()) {
+    return;
+  }
+  try {
+    frames.push(chunk);
+  } catch (error) {
+    destroy();
+    fail(error);
+  }
 }
 
 export interface PodmanSockets {
@@ -238,8 +322,8 @@ export class UnixPodmanClient implements PodmanClient {
   }
 
   /**
-   * Exec start may answer 200 with a body, or 101 and then raw frames.
-   * Stdin is written only on the upgraded socket, as stream-0 frames, then the write side is closed.
+   * Exec start may answer 200 with a body, or 101 and then multiplexed output frames.
+   * Stdin on the upgraded socket is raw bytes (no 8-byte header). socket.end() half-closes it.
    */
   private hijack(
     runtime: RuntimeKind,
@@ -281,9 +365,11 @@ export class UnixPodmanClient implements PodmanClient {
           },
         },
         (res) => {
-          const chunks: Buffer[] = [];
+          const frames = new CappedFrames();
           res.on("data", (chunk: Buffer) => {
-            chunks.push(chunk);
+            takeFrames(frames, chunk, () => {
+              res.destroy();
+            }, fail, () => settled);
           });
           res.on("end", () => {
             const status = res.statusCode ?? 500;
@@ -295,25 +381,32 @@ export class UnixPodmanClient implements PodmanClient {
               fail(new Error("podman exec start did not upgrade for stdin"));
               return;
             }
-            finish(Buffer.concat(chunks));
+            finish(frames.concat());
           });
           res.on("error", fail);
         },
       );
       req.on("upgrade", (_response, socket, head) => {
-        const chunks: Buffer[] = [];
+        const frames = new CappedFrames();
         if (head.length > 0) {
-          chunks.push(head);
+          takeFrames(frames, head, () => {
+            socket.destroy();
+          }, fail, () => settled);
         }
         socket.on("data", (chunk: Buffer) => {
-          chunks.push(chunk);
+          takeFrames(frames, chunk, () => {
+            socket.destroy();
+          }, fail, () => settled);
         });
         socket.on("error", fail);
         socket.on("end", () => {
-          finish(Buffer.concat(chunks));
+          finish(frames.concat());
         });
+        if (settled) {
+          return;
+        }
         if (stdin !== undefined && stdin.length > 0) {
-          socket.write(muxStdinFrames(stdin));
+          socket.write(stdin);
         }
         socket.end();
       });

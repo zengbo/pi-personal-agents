@@ -19,13 +19,13 @@ import {
   type WatchChange,
   type WatchTarget,
 } from "@earendil-works/pi-durable/env";
-import { SANDBOX_PROXY_ENV } from "./flags.ts";
+import { MAX_FILE_BYTES, SANDBOX_PROXY_ENV } from "./flags.ts";
 import {
   CONTAINER_WORKSPACE,
   confineWorkspacePath,
   fileOpArgv,
 } from "./file-op.ts";
-import type { PodmanClient, PodmanExecResult } from "./podman.ts";
+import { PodmanOutputTooLargeError, type PodmanClient, type PodmanExecResult } from "./podman.ts";
 import type { SandboxPool, SandboxSession } from "./pool.ts";
 
 const SECRET_NAME = /token|secret|password|passwd|cookie|authorization|api[_-]?key|credential/i;
@@ -41,6 +41,7 @@ const OP_CODES = new Set([
   "invalid",
   "unknown",
   "root",
+  "too_large",
 ]);
 
 export function containerEnv(extra: Readonly<Record<string, string>> | undefined): Record<string, string> {
@@ -155,12 +156,20 @@ export class SandboxExecutionEnv implements ExecutionEnv {
   }
 
   async writeFile(filePath: string, content: string | Uint8Array, context: Context): Promise<Result<void, FileError>> {
-    const wrote = await this.runOp("write", filePath, toBytes(content), undefined, context);
+    const bytes = toBytes(content);
+    if (bytes.byteLength > MAX_FILE_BYTES) {
+      return err(new FileError("invalid", "too_large", filePath));
+    }
+    const wrote = await this.runOp("write", filePath, bytes, undefined, context);
     return wrote.ok ? ok(undefined) : wrote;
   }
 
   async appendFile(filePath: string, content: string | Uint8Array, context: Context): Promise<Result<void, FileError>> {
-    const wrote = await this.runOp("append", filePath, toBytes(content), undefined, context);
+    const bytes = toBytes(content);
+    if (bytes.byteLength > MAX_FILE_BYTES) {
+      return err(new FileError("invalid", "too_large", filePath));
+    }
+    const wrote = await this.runOp("append", filePath, bytes, undefined, context);
     return wrote.ok ? ok(undefined) : wrote;
   }
 
@@ -228,19 +237,22 @@ export class SandboxExecutionEnv implements ExecutionEnv {
     }
     const text = Buffer.from(listed.value).toString("utf8");
     const entries: FileInfo[] = [];
-    if (text.length === 0) {
+    const parts = text.split("\0");
+    if (parts.length > 0 && parts[parts.length - 1] === "") {
+      parts.pop();
+    }
+    if (parts.length === 0) {
       return ok(entries);
     }
-    for (const line of text.split("\n")) {
-      if (line.length === 0) {
-        continue;
-      }
-      const parts = line.split("\t");
-      const name = parts[0];
-      const kind = parts[1];
-      const size = parts[2];
-      const mtime = parts[3];
-      if (name === undefined || !isKind(kind) || size === undefined || mtime === undefined || !/^\d+$/.test(size) || !/^\d+$/.test(mtime)) {
+    if (parts.length % 4 !== 0) {
+      return err(new FileError("unknown", "unknown", dirPath));
+    }
+    for (let index = 0; index < parts.length; index += 4) {
+      const name = parts[index];
+      const kind = parts[index + 1];
+      const size = parts[index + 2];
+      const mtime = parts[index + 3];
+      if (name === undefined || name.length === 0 || !isKind(kind) || size === undefined || mtime === undefined || !/^\d+$/.test(size) || !/^\d+$/.test(mtime)) {
         return err(new FileError("unknown", "unknown", dirPath));
       }
       entries.push({
@@ -458,6 +470,9 @@ export class SandboxExecutionEnv implements ExecutionEnv {
       }
       if (error instanceof FileError) {
         return err(error);
+      }
+      if (error instanceof PodmanOutputTooLargeError) {
+        return err(new FileError("invalid", "too_large", requestPath));
       }
       return err(new FileError("unknown", "unknown", requestPath));
     } finally {

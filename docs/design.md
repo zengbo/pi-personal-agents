@@ -98,7 +98,7 @@ sequenceDiagram
   - `crun`（当前唯一生产档）：`/run/sbx/podman.sock`。create 然后 start。内存 / pids / cpu 由 Podman spec 施加。
   - `runsc`：controller 不启动，`set_runtime` 选它会被拒绝，直到有一条不经过 agentctl `runuser` 的 set-property 路径。重新启用时必须在 start 之前设置 libpod-conmon scope 的 `MemoryMax=768M`、`TasksMax=256`、`CPUQuota=100%`。主机上的 gVisor socket 可以仍在，供环境脚本检查。外层 `user-1001.slice` 有全局上限兜底。
 - **并发**：最多 3 个运行中容器（3×768m），超出排队（FIFO，带取消）。空闲超时（默认 10 分钟）stop 容器，工作区保留。
-- **文件操作**：全部在容器内 exec（`cat --`、stdin 上的 `tee`、`ls` / `stat` / `mv`）。路径限制在 `/workspace`，拒绝 `..` 和越出 `/workspace` 的绝对路径，并用 `realpath` 确认目标落在 `/workspace` 下。符号链接目标和 `nlink>1` 的普通文件不返回内容。controller 不打开叶子。helper 创建叶子仍用 `openat2`。
+- **文件操作**：全部在容器内 exec（不超过 8 MiB 的 `head -c`、原始 stdin 上的 `tee`、`find` / `stat` / `mv`）。路径限制在 `/workspace`，拒绝 `..` 和越出 `/workspace` 的绝对路径，并用 `realpath` 确认目标落在 `/workspace` 下。符号链接目标和 `nlink>1` 的普通文件不返回内容。超过 8 MiB 返回 `too_large`，不把超出的字节交回去。controller 不打开叶子。helper 创建叶子仍用 `openat2`。
 - **replay**：所有 exec 类工具默认不 replay（崩溃后告诉模型“被中断”）；只读工具经测试后可标 `replay:"safe"`。
 
 ### 3.2 审批与策略引擎

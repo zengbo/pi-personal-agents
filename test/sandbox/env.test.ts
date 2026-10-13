@@ -5,7 +5,8 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { SandboxExecutionEnv } from "../../src/sandbox/env.ts";
 import { FILE_OP_SCRIPT, parseFileOpArgv, runFileOp } from "../../src/sandbox/file-op.ts";
-import { createPodmanDriver, type PodmanClient, type PodmanExecResult } from "../../src/sandbox/podman.ts";
+import { MAX_FILE_BYTES } from "../../src/sandbox/flags.ts";
+import { createPodmanDriver, PodmanOutputTooLargeError, type PodmanClient, type PodmanExecResult } from "../../src/sandbox/podman.ts";
 import { SandboxPool, type SandboxDriver, type SandboxSession } from "../../src/sandbox/pool.ts";
 import { createSessionLeaf } from "../../src/sandbox/workspace-helper.ts";
 
@@ -62,7 +63,8 @@ describe("sandbox execution env", () => {
       const real = await env.readTextFile("plain.txt", context);
       expect(real.ok ? real.value : "").toBe("inside");
       expect(ops).toContain("read");
-      expect(FILE_OP_SCRIPT).toContain("cat --");
+      expect(FILE_OP_SCRIPT).toContain('head -c "$((max_bytes + 1))"');
+      expect(FILE_OP_SCRIPT).toContain("too_large");
       expect(FILE_OP_SCRIPT).toContain("realpath -e");
       expect(readFileSync(path.resolve("src/sandbox/env.ts"), "utf8")).not.toContain("node:fs");
       const direct = runFileOp(leaf, "read", path.join(leaf, "link.txt"));
@@ -134,6 +136,122 @@ describe("sandbox execution env", () => {
     } finally {
       await pool.shutdown();
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a write larger than 8 MiB before exec", async () => {
+    let started = 0;
+    let execs = 0;
+    const client: PodmanClient = {
+      create: async () => "c",
+      start: async () => undefined,
+      stop: async () => undefined,
+      exec: async (_runtime, _id, _command, options) => {
+        execs += 1;
+        expect(options?.stdin?.byteLength).toBe(MAX_FILE_BYTES);
+        return emptyExec();
+      },
+    };
+    const driver: SandboxDriver = {
+      start() {
+        started += 1;
+        return Promise.resolve({ containerId: "c" });
+      },
+      stop() {
+        return Promise.resolve();
+      },
+    };
+    const pool = new SandboxPool(driver, { idleMs: 60_000 });
+    try {
+      const env = new SandboxExecutionEnv(pool, client, session("/tmp/unused-leaf", "sess"));
+      const wrote = await env.writeFile("big.bin", Buffer.alloc(MAX_FILE_BYTES + 1), context);
+      expect(wrote.ok).toBe(false);
+      if (!wrote.ok) {
+        expect(wrote.error.message).toBe("too_large");
+      }
+      const appended = await env.appendFile("big.bin", Buffer.alloc(MAX_FILE_BYTES + 1), context);
+      expect(appended.ok).toBe(false);
+      if (!appended.ok) {
+        expect(appended.error.message).toBe("too_large");
+      }
+      expect(execs).toBe(0);
+      expect(started).toBe(0);
+      const counted = await env.writeFile("exact.bin", Buffer.alloc(MAX_FILE_BYTES), context);
+      expect(counted.ok).toBe(true);
+      expect(execs).toBe(1);
+      expect(started).toBe(1);
+    } finally {
+      await pool.shutdown();
+    }
+  });
+
+  it("returns too_large for a read past 8 MiB and does not emit the bytes", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "ppa-env-"));
+    const backed = scriptBacked([]);
+    const pool = backed.pool;
+    try {
+      const leaf = sessionLeaf(root, "ops", "sess");
+      writeFileSync(path.join(leaf, "big.bin"), Buffer.alloc(MAX_FILE_BYTES + 1, 0xab));
+      const direct = runFileOp(leaf, "read", path.join(leaf, "big.bin"));
+      expect(direct.exitCode).not.toBe(0);
+      expect(direct.stderr.trim()).toBe("too_large");
+      expect(direct.stdout.length).toBe(0);
+      writeFileSync(path.join(leaf, "exact.bin"), Buffer.alloc(MAX_FILE_BYTES, 0x11));
+      const exactRead = runFileOp(leaf, "read", path.join(leaf, "exact.bin"));
+      expect(exactRead.exitCode).toBe(0);
+      expect(exactRead.stdout.length).toBe(MAX_FILE_BYTES);
+      expect(exactRead.stdout[0]).toBe(0x11);
+      expect(exactRead.stdout[MAX_FILE_BYTES - 1]).toBe(0x11);
+      const env = new SandboxExecutionEnv(pool, backed.client, session(leaf, "sess"));
+      const read = await env.readBinaryFile("big.bin", context);
+      expect(read.ok).toBe(false);
+      if (!read.ok) {
+        expect(read.error.message).toBe("too_large");
+      }
+      expect(JSON.stringify(read)).not.toMatch(/ab{8,}/);
+    } finally {
+      await pool.shutdown();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("lists a file whose name contains a newline", async () => {
+    const root = mkdtempSync(path.join(tmpdir(), "ppa-env-"));
+    const backed = scriptBacked([]);
+    const pool = backed.pool;
+    try {
+      const leaf = sessionLeaf(root, "ops", "sess");
+      writeFileSync(path.join(leaf, "a\nb.txt"), "x");
+      const env = new SandboxExecutionEnv(pool, backed.client, session(leaf, "sess"));
+      const listed = await env.listDir("/workspace", context);
+      expect(listed.ok).toBe(true);
+      if (listed.ok) {
+        expect(listed.value.map((entry) => entry.name)).toContain("a\nb.txt");
+        expect(listed.value.find((entry) => entry.name === "a\nb.txt")?.kind).toBe("file");
+      }
+    } finally {
+      await pool.shutdown();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("maps an oversized exec stream to too_large", async () => {
+    const client: PodmanClient = {
+      create: async () => "c",
+      start: async () => undefined,
+      stop: async () => undefined,
+      exec: () => Promise.reject(new PodmanOutputTooLargeError()),
+    };
+    const pool = new SandboxPool(createPodmanDriver(client), { idleMs: 60_000 });
+    try {
+      const env = new SandboxExecutionEnv(pool, client, session("/tmp/unused-leaf", "sess"));
+      const read = await env.readTextFile("note.txt", context);
+      expect(read.ok).toBe(false);
+      if (!read.ok) {
+        expect(read.error.message).toBe("too_large");
+      }
+    } finally {
+      await pool.shutdown();
     }
   });
 });

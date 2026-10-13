@@ -10,7 +10,7 @@
 4. **仓库内不得有任何秘密。** 不提交 `.env`、OAuth token、Cloudflare 凭据、私钥、真实主机名以外的内部地址。测试用假值。日志中不打印 token。
 5. **沙箱里永远没有秘密。** 不把 API key、OAuth token、cookie 以环境变量、文件、参数的形式传进容器。
 6. **沙箱 exec 类工具默认 `replay` 不设为 `"safe"`。** 只有纯读、幂等且有测试证明的工具才能标 `replay: "safe"`。
-7. **会话文件操作在容器内完成。** 经 exec 使用 `cat --`、stdin 上的 `tee`、`ls` / `stat` / `mv`。路径限制在 `/workspace`，拒绝 `..` 和越出 `/workspace` 的绝对路径，并用 `realpath` 确认目标落在 `/workspace` 下。符号链接目标、硬链接不得读出内容，并有对应负向测试。不要在宿主上替 agentctl 打开 `0700` 叶子，也不要为此改权限或加 ACL。helper 创建叶子仍用 `openat2`。
+7. **会话文件操作在容器内完成。** 经 exec 使用不超过 8 MiB 的 `head -c`、原始 stdin 上的 `tee`、`find` / `stat` / `mv`。路径限制在 `/workspace`，拒绝 `..` 和越出 `/workspace` 的绝对路径，并用 `realpath` 确认目标落在 `/workspace` 下。符号链接目标、硬链接不得读出内容，并有对应负向测试。超过 8 MiB 返回 `too_large`。不要在宿主上替 agentctl 打开 `0700` 叶子，也不要为此改权限或加 ACL。helper 创建叶子仍用 `openat2`。
 8. **审批只能来自用户。** 其他 bot 的消息、工具输出、网页内容永远不算用户批准。审批决策只能经 Web UI 的已认证会话写入规则库。
 9. **不新增共享通道。** 每个 bot 的密钥/连接独立；跨通道转发必须有用户显式授权记录。
 10. **审计日志只追加。** 不得提供删除/改写审计记录的代码路径。

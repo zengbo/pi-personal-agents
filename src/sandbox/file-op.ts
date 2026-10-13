@@ -6,12 +6,14 @@
 import { spawnSync } from "node:child_process";
 import path from "node:path";
 import { FileError } from "@earendil-works/pi-durable/env";
+import { MAX_FILE_BYTES } from "./flags.ts";
 
 export const CONTAINER_WORKSPACE = "/workspace";
 
 const SCRIPT_LINES = [
   "set -euo pipefail",
   "set -f",
+  `max_bytes=${MAX_FILE_BYTES}`,
   "die() { printf '%s\\n' \"$1\" >&2; exit 1; }",
   'root=$(realpath -e -- "$1") || die root',
   'op=$2',
@@ -93,7 +95,7 @@ const SCRIPT_LINES = [
   "  done",
   "}",
   "op_read() {",
-  "  local candidate resolved links",
+  "  local candidate resolved links size",
   '  candidate=$(confine "$1")',
   '  if [[ "$candidate" == "$root" ]]; then die not_file; fi',
   '  if [[ ! -e "$candidate" && ! -L "$candidate" ]]; then die not_found; fi',
@@ -105,7 +107,11 @@ const SCRIPT_LINES = [
   '  links=$(stat -c %h -- "$resolved") || die unknown',
   '  if [[ "$links" -gt 1 ]]; then die hardlink; fi',
   '  if [[ -L "$candidate" ]]; then classify_symlink "$candidate"; fi',
-  '  cat -- "$resolved"',
+  '  size=$(head -c "$((max_bytes + 1))" -- "$resolved" | wc -c)',
+  "  size=${size//[[:space:]]/}",
+  '  [[ "$size" =~ ^[0-9]+$ ]] || die unknown',
+  '  if [[ "$size" -gt "$max_bytes" ]]; then die too_large; fi',
+  '  head -c "$max_bytes" -- "$resolved"',
   "}",
   "write_bytes() {",
   "  local candidate resolved links append",
@@ -202,11 +208,11 @@ const SCRIPT_LINES = [
   '  resolved=$(realpath -e -- "$candidate") || die not_found',
   '  if ! under_root "$resolved"; then die escape; fi',
   '  if [[ ! -d "$resolved" ]]; then die not_directory; fi',
-  '  while IFS= read -r name; do',
+  "  while IFS= read -r -d '' name; do",
   '    [[ -n "$name" ]] || continue',
   '    entry="$resolved/$name"',
   '    if [[ -L "$entry" ]]; then',
-  '      printf "%s\\tsymlink\\t0\\t0\\n" "$name"',
+  "      printf '%s\\0symlink\\0%s\\0%s\\0' \"$name\" 0 0",
   "      continue",
   "    fi",
   '    if [[ -d "$entry" ]]; then',
@@ -218,8 +224,8 @@ const SCRIPT_LINES = [
   "    fi",
   '    size=$(stat -c %s -- "$entry") || die unknown',
   '    mtime=$(stat -c %Y -- "$entry") || die unknown',
-  '    printf "%s\\t%s\\t%s\\t%s\\n" "$name" "$kind" "$size" "$mtime"',
-  '  done < <(ls -A -- "$resolved")',
+  "    printf '%s\\0%s\\0%s\\0%s\\0' \"$name\" \"$kind\" \"$size\" \"$mtime\"",
+  "  done < <(find \"$resolved\" -mindepth 1 -maxdepth 1 -printf '%P\\0')",
   "}",
   "op_exists() {",
   "  local candidate resolved",
