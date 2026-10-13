@@ -1,6 +1,6 @@
 # Template for the controller system unit. Not installed by CI.
 # Do not copy this onto racknerd_us from an agent session.
-# Phase 1 replaces ExecStart with the real controller entrypoint.
+# Phase 1 starts the TypeScript entry with Node's type stripper. Node >= 22.19.
 # Secrets stay in /home/agentctl/secrets (mode 0700) and are never stored in this file.
 
 [Unit]
@@ -14,7 +14,7 @@ User=agentctl
 Group=agentctl
 WorkingDirectory=/home/agentctl/app
 EnvironmentFile=-/home/agentctl/secrets/controller.env
-ExecStart=/usr/bin/node /home/agentctl/app/dist/controller.js
+ExecStart=/usr/bin/node --experimental-strip-types /home/agentctl/app/src/controller.ts
 Restart=on-failure
 RestartSec=2
 UMask=0077

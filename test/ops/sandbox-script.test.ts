@@ -5,6 +5,28 @@ import { describe, expect, it } from "vitest";
 
 const scriptPath = path.resolve("ops/tests/sandbox-env.sh");
 const script = readFileSync(scriptPath, "utf8");
+const SBX_OVERRIDES = [
+  "SBX_NFT_SNAPSHOT",
+  "SBX_TINYPROXY_CONF",
+  "SBX_LISTEN_SNAPSHOT",
+  "SBX_WORKSPACE_ROOT",
+  "SBX_SLICE_LIMITS",
+] as const;
+
+function directEnv(extra: Record<string, string | undefined> = {}): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  for (const name of SBX_OVERRIDES) {
+    delete env[name];
+  }
+  for (const [name, value] of Object.entries(extra)) {
+    if (value === undefined) {
+      delete env[name];
+    } else {
+      env[name] = value;
+    }
+  }
+  return env;
+}
 
 function runSourced(body: string): { status: number; stderr: string } {
   try {
@@ -22,7 +44,7 @@ function runSourced(body: string): { status: number; stderr: string } {
 describe("VPS environment script", () => {
   it("lists 48 implemented checks and parses", () => {
     execFileSync("bash", ["-n", scriptPath]);
-    const listed = execFileSync("bash", [scriptPath, "--list"], { encoding: "utf8" })
+    const listed = execFileSync("bash", [scriptPath, "--list"], { encoding: "utf8", env: directEnv() })
       .trim()
       .split("\n");
     expect(listed).toHaveLength(48);
@@ -63,6 +85,27 @@ describe("VPS environment script", () => {
     expect(script).not.toMatch(/\bssh\s+-/);
     expect(script).not.toContain("scp ");
     expect(script).not.toContain("cat /home/agentctl/secrets");
+  });
+
+  it("refuses a direct run when an SBX_* test override is set", () => {
+    for (const name of SBX_OVERRIDES) {
+      let status = 0;
+      let stderr = "";
+      try {
+        execFileSync("bash", [scriptPath, "--list"], {
+          encoding: "utf8",
+          env: directEnv({ [name]: "/tmp/ppa-not-the-host" }),
+        });
+      } catch (error) {
+        const failed = error as { status?: number; stderr?: string };
+        status = failed.status ?? 1;
+        stderr = failed.stderr ?? "";
+      }
+      expect(status, name).not.toBe(0);
+      expect(stderr, name).toContain(name);
+    }
+    const listed = execFileSync("bash", [scriptPath, "--list"], { encoding: "utf8", env: directEnv() });
+    expect(listed).toContain("H14");
   });
 
   it("fails require_dir_mode on mode 0755 even when the owner matches", () => {

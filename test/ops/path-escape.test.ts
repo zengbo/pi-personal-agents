@@ -2,13 +2,14 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { PathEscapeError, readWorkspaceFile, selfTest } from "../../ops/tests/path-escape-check.js";
+import { PathEscapeError, readWorkspaceFile, selfTest, workspaceReadBackend } from "../../ops/tests/path-escape-check.js";
 
 describe("workspace path escape checks", () => {
   it("rejects symlink, dotdot, and hardlink escapes", () => {
     expect(() => {
       selfTest();
     }).not.toThrow();
+    expect(workspaceReadBackend()).toBe("openat2");
   });
 
   it("does not return the outside sentinel when a symlink is rejected", () => {

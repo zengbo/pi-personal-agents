@@ -23,7 +23,7 @@
 
 ## 状态
 
-设计阶段（2026-10-12）。尚无代码。Phase 1 见实施计划。
+Phase 0 已合并。Phase 1（controller、Web、三个 bot、Podman 沙箱、审批）在分支上实现，见 [docs/phase-1.md](docs/phase-1.md)。设计文档仍是规格；VPS 上的 48 项环境测试不在 CI 里重跑，也不从这里登录 `racknerd_us`。
 
 ## 依赖版本（精确锁定）
 

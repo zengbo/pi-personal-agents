@@ -2,9 +2,9 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { NODE_ENGINE, PHASE } from "../../src/index.js";
 
-describe("phase 0 baseline", () => {
+describe("package pins", () => {
   it("exports the phase marker", () => {
-    expect(PHASE).toBe(0);
+    expect(PHASE).toBe(1);
     expect(NODE_ENGINE).toBe(">=22.19.0");
   });
 

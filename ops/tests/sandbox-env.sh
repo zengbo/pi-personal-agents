@@ -13,6 +13,25 @@ MAX_SANDBOXES=3
 ALLOW_PROBE_HOST="${SBX_ALLOW_PROBE_HOST:-github.com}"
 DENY_PROBE_HOST="${SBX_DENY_PROBE_HOST:-not-allowlisted.example}"
 
+# Unit tests source this file and point checks at fixtures. A direct run
+# (the operator suite, including --list) must see the live host instead.
+SBX_OVERRIDE_VARS=(
+  SBX_NFT_SNAPSHOT
+  SBX_TINYPROXY_CONF
+  SBX_LISTEN_SNAPSHOT
+  SBX_WORKSPACE_ROOT
+  SBX_SLICE_LIMITS
+)
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  for _sbx_override in "${SBX_OVERRIDE_VARS[@]}"; do
+    if [[ -n "${!_sbx_override:-}" ]]; then
+      echo "refusing to run: ${_sbx_override} is set; SBX_* overrides are only valid when this file is sourced by unit tests" >&2
+      exit 1
+    fi
+  done
+  unset _sbx_override
+fi
+
 # Mandatory container flags. Keep these in lockstep with docs/vps-environment.md.
 HARD_FLAGS=(
   --userns "keep-id:uid=1000,gid=1000"
