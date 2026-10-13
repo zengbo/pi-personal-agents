@@ -1,6 +1,6 @@
 import http from "node:http";
-import { RUNSC_SCOPE_PROPERTIES } from "./flags.ts";
 import type { SandboxDriver, SandboxSession } from "./pool.ts";
+import { RUNSC_DISABLED_MESSAGE } from "./runtime-guard.ts";
 import { buildSandboxSpec, specKeepsSandbox, type SandboxSpec } from "./spec.ts";
 import type { RuntimeKind } from "./pool.ts";
 
@@ -22,22 +22,22 @@ export interface PodmanClient {
   ): Promise<PodmanExecResult>;
 }
 
-export interface CommandRunner {
-  run(argv: readonly string[]): Promise<{ readonly code: number }>;
-}
-
 export function containerName(session: SandboxSession): string {
   const raw = `ppa-${session.bot}-${session.session}`;
   return raw.replace(/[^A-Za-z0-9_.-]/g, "").slice(0, 60);
 }
 
 /**
- * crun: create then start. runsc: create, set the conmon scope limits, then start.
- * A failed set-property does not start the container.
+ * Production start is crun only: create, then start.
+ * runsc is refused before create. Scope properties are not applied from this process.
+ * crun limits stay on the podman spec (memory, pids, cpu, cap_drop, no_new_privileges, read-only).
  */
-export function createPodmanDriver(client: PodmanClient, runner: CommandRunner): SandboxDriver {
+export function createPodmanDriver(client: PodmanClient): SandboxDriver {
   return {
     async start(session) {
+      if (session.runtime !== "crun") {
+        throw new Error(RUNSC_DISABLED_MESSAGE);
+      }
       const spec = buildSandboxSpec({
         name: containerName(session),
         workspaceLeaf: session.workspaceLeaf,
@@ -45,25 +45,15 @@ export function createPodmanDriver(client: PodmanClient, runner: CommandRunner):
       if (!specKeepsSandbox(spec)) {
         throw new Error("refusing to start a weakened sandbox");
       }
-      const id = await client.create(session.runtime, spec);
-      if (session.runtime === "runsc") {
-        const result = await runner.run([
-          "systemctl",
-          "--user",
-          "set-property",
-          `libpod-conmon-${id}.scope`,
-          ...RUNSC_SCOPE_PROPERTIES,
-        ]);
-        if (result.code !== 0) {
-          await client.stop(session.runtime, id);
-          throw new Error("runsc limits were not applied; container was not started");
-        }
-      }
-      await client.start(session.runtime, id);
+      const id = await client.create("crun", spec);
+      await client.start("crun", id);
       return { containerId: id };
     },
     async stop(session, containerId) {
-      await client.stop(session.runtime, containerId);
+      if (session.runtime !== "crun") {
+        throw new Error(RUNSC_DISABLED_MESSAGE);
+      }
+      await client.stop("crun", containerId);
     },
   };
 }
@@ -97,7 +87,6 @@ export function demuxPodmanFrames(buffer: Buffer): { stdout: string; stderr: str
 
 export interface PodmanSockets {
   readonly crun: string;
-  readonly runsc: string;
 }
 
 export class UnixPodmanClient implements PodmanClient {
@@ -170,7 +159,10 @@ export class UnixPodmanClient implements PodmanClient {
     body: Buffer,
     headers: Record<string, string> = {},
   ): Promise<Buffer> {
-    const socketPath = runtime === "crun" ? this.sockets.crun : this.sockets.runsc;
+    if (runtime !== "crun") {
+      return Promise.reject(new Error(RUNSC_DISABLED_MESSAGE));
+    }
+    const socketPath = this.sockets.crun;
     return new Promise((resolve, reject) => {
       const req = http.request(
         {

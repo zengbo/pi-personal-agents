@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { mkdtempSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createModels } from "@earendil-works/pi-ai/models";
@@ -15,6 +15,7 @@ import { PolicyStore } from "../../src/policy/store.ts";
 import type { PodmanClient, PodmanExecResult } from "../../src/sandbox/podman.ts";
 import { createPodmanDriver } from "../../src/sandbox/podman.ts";
 import { SandboxPool } from "../../src/sandbox/pool.ts";
+import { startWorkspaceHelper, type WorkspaceHelper } from "../../src/sandbox/workspace-helper.ts";
 import type { SandboxSpec } from "../../src/sandbox/spec.ts";
 import type { RuntimeKind } from "../../src/sandbox/pool.ts";
 import type { AccessKey } from "../../src/web/access.ts";
@@ -108,11 +109,16 @@ export async function startTestRig(options?: TestRigOptions): Promise<TestRig> {
   const engine = new PolicyEngine(new PolicyStore(path.join(dataDir, "policy.sqlite")), new AuditLog(path.join(dataDir, "audit.jsonl")));
   options?.prepare?.(models);
   const podman = new FakePodman(options?.exec);
-  const runner = { run: async () => ({ code: 0 }) };
-  const pool = new SandboxPool(createPodmanDriver(podman, runner));
-  const controller = await startController({
+  const pool = new SandboxPool(createPodmanDriver(podman));
+  prepareWorkspaceParents(workspaceRoot);
+  const workspaceSocket = path.join(root, "workspace.sock");
+  const helper = await startWorkspaceHelper({ root: workspaceRoot, socketPath: workspaceSocket });
+  let controller: RunningController;
+  try {
+    controller = await startController({
     dataDir,
     workspaceRoot,
+    workspaceSocket,
     port: 0,
     access: {
       audience: "test-aud",
@@ -139,6 +145,10 @@ export async function startTestRig(options?: TestRigOptions): Promise<TestRig> {
     compaction: options?.compaction,
     onHarness: options?.onHarness,
   });
+  } catch (error) {
+    await helper.close();
+    throw error;
+  }
   return {
     root,
     dataDir,
@@ -150,8 +160,23 @@ export async function startTestRig(options?: TestRigOptions): Promise<TestRig> {
     login,
     secrets,
     faux: models,
-    close: () => controller.close(),
+    close: () => closeRig(controller, helper),
   };
+}
+
+async function closeRig(controller: RunningController, helper: WorkspaceHelper): Promise<void> {
+  await controller.close();
+  await helper.close();
+}
+
+function prepareWorkspaceParents(root: string): void {
+  mkdirSync(root, { recursive: true });
+  chmodSync(root, 0o750);
+  for (const bot of BOTS) {
+    const parent = path.join(root, bot);
+    mkdirSync(parent, { recursive: true });
+    chmodSync(parent, 0o750);
+  }
 }
 
 export function signJwt(key: crypto.KeyObject, payload: Record<string, unknown>, kid = "test"): string {

@@ -96,7 +96,7 @@ H11	user-1001.slice TasksMax is 2048
 H12	user-1001.slice CPUQuota is 250%
 H13	nft table inet sbx_egress exists and drops other egress
 H14	tinyproxy binds 127.0.0.1:8888 and FilterDefaultDeny is Yes
-H15	workspace parents stay at most 0750; only a session leaf may be 0777
+H15	workspace parents stay at most 0750; a session leaf is 0700
 H16	symlink, dotdot, and hardlink workspace reads are rejected
 T8	three 768m sandboxes keep host used memory under 3000 MiB and sshd alive
 T9	running sandbox containers do not exceed 3
@@ -485,8 +485,8 @@ test_H15() {
       [[ -e "$session" ]] || continue
       [[ ! -L "$session" ]] || return 1
       smode="$(stat -c %a "$session")" || return 1
-      # A session leaf may be 0777. 022 = group-write or other-write.
-      [[ "$smode" == "777" || $((8#$smode & 8#022)) -eq 0 ]] || return 1
+      # Session leaves are 0700, owner sbx. 0777 is not accepted.
+      [[ "$smode" == "700" ]] || return 1
     done
   done
 }

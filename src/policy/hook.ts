@@ -1,5 +1,6 @@
 import type { JsonValue } from "@earendil-works/chord";
 import { ToolTask, hook } from "@earendil-works/pi-durable";
+import { refuseDisabledRuntime } from "../sandbox/runtime-guard.ts";
 import type { PolicyEngine } from "./engine.ts";
 
 interface StoredDecision {
@@ -8,11 +9,24 @@ interface StoredDecision {
   [key: string]: JsonValue;
 }
 
+function runtimeArgument(args: unknown): unknown {
+  if (typeof args !== "object" || args === null || !("runtime" in args)) {
+    return undefined;
+  }
+  return args.runtime;
+}
+
 /** beforeTool hook. A stored memo is reused so recovery does not ask again. */
 export function policyExtensionHook(bot: string, engine: PolicyEngine) {
   return hook(ToolTask, {
     beforeTool: async (call, api, context) => {
       try {
+        if (call.name === "set_runtime") {
+          const refused = refuseDisabledRuntime(runtimeArgument(call.arguments));
+          if (refused !== undefined) {
+            return { block: refused };
+          }
+        }
         const memoKey = `approval:${String(api.taskId)}`;
         const stored = (await api.memo(memoKey, context)) as StoredDecision | undefined;
         if (stored?.decision === "allow") {

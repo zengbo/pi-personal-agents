@@ -1,0 +1,25 @@
+# sbx-owned helper that creates one session leaf. Not installed by CI.
+# Do not copy this onto racknerd_us from an agent session.
+# User=sbx so the leaf owner is sbx. The controller unit does not gain this
+# ReadWritePaths entry, and its NoNewPrivileges / ProtectSystem stay unchanged.
+# Enable the socket unit, not this service. systemd starts it on the first connection.
+
+[Unit]
+Description=sbx session workspace helper
+Requires=sbx-workspace.socket
+After=sbx-workspace.socket
+
+[Service]
+Type=simple
+User=sbx
+Group=sbx
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/home/sbx/workspaces
+Environment=PPA_WORKSPACE_ROOT=/home/sbx/workspaces
+ExecStart=/usr/bin/node --experimental-strip-types /usr/local/lib/pi-personal-agents/sbx-workspace.ts
+Restart=on-failure
+RestartSec=2

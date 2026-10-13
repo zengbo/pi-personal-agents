@@ -1,13 +1,11 @@
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { MAX_RUNNING_SANDBOXES, SANDBOX_MEMORY_BYTES } from "../../src/sandbox/flags.ts";
-import { createPodmanDriver, demuxPodmanFrames, type CommandRunner, type PodmanClient } from "../../src/sandbox/podman.ts";
+import { MAX_RUNNING_SANDBOXES, RUNSC_SCOPE_PROPERTIES, SANDBOX_MEMORY_BYTES } from "../../src/sandbox/flags.ts";
+import { createPodmanDriver, demuxPodmanFrames, type PodmanClient } from "../../src/sandbox/podman.ts";
 import { SandboxPool, type SandboxDriver, type SandboxSession } from "../../src/sandbox/pool.ts";
+import { RUNSC_DISABLED_MESSAGE } from "../../src/sandbox/runtime-guard.ts";
 import { buildSandboxSpec, specKeepsSandbox } from "../../src/sandbox/spec.ts";
-import { ensureWorkspace, WorkspaceModeError } from "../../src/sandbox/workspace.ts";
-import { chmodSync, mkdirSync, statSync } from "node:fs";
 
 describe("sandbox pool", () => {
   it("queues the fourth sandbox until one stops", async () => {
@@ -137,7 +135,7 @@ describe("sandbox pool", () => {
     await pool.shutdown();
   });
 
-  it("applies runsc limits before start and refuses a failed set-property", async () => {
+  it("starts crun without set-property and refuses runsc before create", async () => {
     const events: string[] = [];
     const client: PodmanClient = {
       create: async (runtime) => {
@@ -152,22 +150,17 @@ describe("sandbox pool", () => {
       },
       exec: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
     };
-    const commands: string[][] = [];
-    const runner: CommandRunner = {
-      run: (argv) => {
-        commands.push([...argv]);
-        return Promise.resolve({ code: 0 });
-      },
-    };
-    const driver = createPodmanDriver(client, runner);
-    await driver.start(session("s", "runsc"));
-    expect(events).toEqual(["create:runsc", "start"]);
-    expect(commands[0]?.slice(0, 4)).toEqual(["systemctl", "--user", "set-property", "libpod-conmon-id1.scope"]);
-    expect(commands[0]?.join(" ")).toContain("MemoryMax=768M");
-    const failing: CommandRunner = { run: () => Promise.resolve({ code: 1 }) };
-    const blocked = createPodmanDriver(client, failing);
-    await expect(blocked.start(session("s2", "runsc"))).rejects.toThrow(/not started/);
-    expect(events).toContain("stop");
+    const driver = createPodmanDriver(client);
+    await driver.start(session("s", "crun"));
+    expect(events).toEqual(["create:crun", "start"]);
+    await expect(driver.start(session("s2", "runsc"))).rejects.toThrow(RUNSC_DISABLED_MESSAGE);
+    expect(events).toEqual(["create:crun", "start"]);
+    const driverSource = readFileSync(path.resolve("src/sandbox/podman.ts"), "utf8");
+    const controllerSource = readFileSync(path.resolve("src/controller.ts"), "utf8");
+    expect(driverSource).not.toMatch(/"runuser"/);
+    expect(driverSource).not.toMatch(/"set-property"/);
+    expect(controllerSource).not.toMatch(/"runuser"/);
+    expect([...RUNSC_SCOPE_PROPERTIES]).toEqual(["MemoryMax=768M", "TasksMax=256", "CPUQuota=100%"]);
   });
 
   it("refuses to raise the concurrency cap", () => {
@@ -203,24 +196,6 @@ describe("sandbox spec", () => {
     };
     const decoded = demuxPodmanFrames(Buffer.concat([frame(1, stdout), frame(2, stderr)]));
     expect(decoded).toEqual({ stdout: "out", stderr: "err" });
-  });
-});
-
-describe("workspace directories", () => {
-  it("creates a 0750 parent and a 0777 leaf, and refuses a looser parent", () => {
-    const root = mkdtempSync(path.join(tmpdir(), "ppa-ws-"));
-    try {
-      const leaf = ensureWorkspace(root, "ops", "sess");
-      expect(statSync(path.join(root, "ops")).mode & 0o777).toBe(0o750);
-      expect(statSync(leaf).mode & 0o777).toBe(0o777);
-      const loose = path.join(root, "chief");
-      mkdirSync(loose);
-      chmodSync(loose, 0o755);
-      expect(() => ensureWorkspace(root, "chief", "sess")).toThrow(WorkspaceModeError);
-      expect(statSync(loose).mode & 0o777).toBe(0o755);
-    } finally {
-      rmSync(root, { recursive: true, force: true });
-    }
   });
 });
 

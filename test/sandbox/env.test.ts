@@ -1,12 +1,12 @@
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { linkSync, mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { SandboxExecutionEnv } from "../../src/sandbox/env.ts";
 import { createPodmanDriver, type PodmanClient } from "../../src/sandbox/podman.ts";
 import { SandboxPool } from "../../src/sandbox/pool.ts";
-import { ensureWorkspace } from "../../src/sandbox/workspace.ts";
+import { createSessionLeaf } from "../../src/sandbox/workspace-helper.ts";
 
 const context = BACKGROUND_CONTEXT;
 
@@ -15,7 +15,7 @@ describe("sandbox execution env", () => {
     const root = mkdtempSync(path.join(tmpdir(), "ppa-env-"));
     const pool = new SandboxPool(idleDriver(), { idleMs: 60_000 });
     try {
-      const leaf = ensureWorkspace(root, "ops", "sess");
+      const leaf = sessionLeaf(root, "ops", "sess");
       const outside = path.join(root, "outside.txt");
       writeFileSync(outside, "SENTINEL-SECRET-BYTES");
       symlinkSync(outside, path.join(leaf, "link.txt"));
@@ -44,8 +44,8 @@ describe("sandbox execution env", () => {
     const root = mkdtempSync(path.join(tmpdir(), "ppa-env-"));
     const pool = new SandboxPool(idleDriver(), { idleMs: 60_000 });
     try {
-      const left = ensureWorkspace(root, "ops", "left");
-      const right = ensureWorkspace(root, "ops", "right");
+      const left = sessionLeaf(root, "ops", "left");
+      const right = sessionLeaf(root, "ops", "right");
       const client = recordingClient();
       const a = new SandboxExecutionEnv(pool, client.client, session(left, "left"));
       const b = new SandboxExecutionEnv(pool, client.client, session(right, "right"));
@@ -74,7 +74,7 @@ describe("sandbox execution env", () => {
         return { exitCode: 0, stdout: "", stderr: "" };
       },
     };
-    const pool = new SandboxPool(createPodmanDriver(client, { run: async () => ({ code: 0 }) }), { idleMs: 60_000 });
+    const pool = new SandboxPool(createPodmanDriver(client), { idleMs: 60_000 });
     try {
       const leaf = path.join(root, "leaf");
       mkdirSync(leaf, { recursive: true });
@@ -91,6 +91,16 @@ describe("sandbox execution env", () => {
     }
   });
 });
+
+function sessionLeaf(root: string, bot: string, sessionName: string): string {
+  chmodSync(root, 0o750);
+  const parent = path.join(root, bot);
+  if (!existsSync(parent)) {
+    mkdirSync(parent);
+  }
+  chmodSync(parent, 0o750);
+  return createSessionLeaf(root, bot, sessionName);
+}
 
 function session(leaf: string, name: string) {
   return { bot: "ops", session: name, runtime: "crun" as const, workspaceLeaf: leaf };

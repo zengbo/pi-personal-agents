@@ -20,7 +20,8 @@ import type { PolicyEngine } from "../policy/engine.ts";
 import type { PodmanClient } from "../sandbox/podman.ts";
 import { SandboxExecutionEnv } from "../sandbox/env.ts";
 import type { RuntimeKind, SandboxPool } from "../sandbox/pool.ts";
-import { ensureWorkspace } from "../sandbox/workspace.ts";
+import { RUNSC_DISABLED_MESSAGE, refuseDisabledRuntime } from "../sandbox/runtime-guard.ts";
+import { requestSessionLeaf } from "../sandbox/workspace-helper.ts";
 import type { AccessCheck } from "../web/access.ts";
 import { startWeb, type ViewEntry, type WebApp } from "../web/server.ts";
 import { holdFlock, type FileLock } from "./lock.ts";
@@ -30,6 +31,8 @@ const context = BACKGROUND_CONTEXT;
 export interface ControllerOptions {
   readonly dataDir: string;
   readonly workspaceRoot: string;
+  /** Unix socket of the sbx workspace helper. The controller only requests a leaf; it does not mkdir. */
+  readonly workspaceSocket: string;
   readonly port: number;
   readonly host?: string;
   readonly access: AccessCheck;
@@ -84,13 +87,17 @@ export async function startController(options: ControllerOptions): Promise<Runni
             compaction: controllerCompaction(options.compaction),
             retry: { enabled: false, maxRetries: 0, baseDelayMs: 0 },
           },
-          env: (target) => {
+          env: async (target) => {
             const session = sanitizeSession(String(target.conversationId));
-            const leaf = ensureWorkspace(options.workspaceRoot, bot, session);
+            const leaf = await requestSessionLeaf(options.workspaceSocket, options.workspaceRoot, bot, session);
+            const runtime = runtimes.get(`${bot}/${session}`) ?? "crun";
+            if (refuseDisabledRuntime(runtime) !== undefined) {
+              throw new Error(RUNSC_DISABLED_MESSAGE);
+            }
             return new SandboxExecutionEnv(options.pool, options.client, {
               bot,
               session,
-              runtime: runtimes.get(`${bot}/${session}`) ?? "crun",
+              runtime: "crun",
               workspaceLeaf: leaf,
             });
           },

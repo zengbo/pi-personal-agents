@@ -2,6 +2,8 @@
 # Do not copy this onto racknerd_us from an agent session.
 # Phase 1 starts the TypeScript entry with Node's type stripper. Node >= 22.19.
 # Secrets stay in /home/agentctl/secrets (mode 0700) and are never stored in this file.
+# Session leaves under /home/sbx/workspaces are created by sbx-workspace.service.
+# Do not add that path to ReadWritePaths. NoNewPrivileges and ProtectSystem stay as below.
 
 [Unit]
 Description=pi-personal-agents controller

@@ -188,7 +188,7 @@ describe("VPS environment script", () => {
       mkdir -p "$root/bot/sess"
       chmod 0755 "$root"
       chmod 0750 "$root/bot"
-      chmod 0777 "$root/bot/sess"
+      chmod 0700 "$root/bot/sess"
       export SBX_WORKSPACE_ROOT="$root"
       if test_H15; then
         echo "0755 workspace root should fail" >&2
@@ -197,12 +197,18 @@ describe("VPS environment script", () => {
       chmod 0750 "$root"
       chmod 0755 "$root/bot"
       if test_H15; then
-        echo "0755 bot parent should fail even when the leaf is 0777" >&2
+        echo "0755 bot parent should fail" >&2
         exit 1
       fi
       chmod 0750 "$root/bot"
+      chmod 0777 "$root/bot/sess"
+      if test_H15; then
+        echo "0777 leaf should fail" >&2
+        exit 1
+      fi
+      chmod 0700 "$root/bot/sess"
       if ! test_H15; then
-        echo "0750 parents and 0777 leaf should pass" >&2
+        echo "0750 parents and 0700 leaf should pass" >&2
         exit 1
       fi
     `);

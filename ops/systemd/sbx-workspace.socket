@@ -1,0 +1,16 @@
+# Socket activation for the sbx session-leaf helper. Not installed by CI.
+# Do not copy this onto racknerd_us from an agent session.
+# SocketMode 0660 and SocketGroup=agentctl: only sbx (the owner) and the agentctl
+# group can connect. Do not chmod 0666, 0662, 0777, or a+rw.
+
+[Unit]
+Description=sbx session workspace helper
+
+[Socket]
+ListenStream=/run/sbx/workspace.sock
+SocketUser=sbx
+SocketGroup=agentctl
+SocketMode=0660
+
+[Install]
+WantedBy=sockets.target

@@ -15,4 +15,8 @@ export const SANDBOX_PROXY_ENV = {
   https_proxy: SANDBOX_PROXY,
 } as const;
 
+/**
+ * Limits a future runsc set-property path must apply before start.
+ * The controller does not call set-property or runuser, and it does not start runsc.
+ */
 export const RUNSC_SCOPE_PROPERTIES = ["MemoryMax=768M", "TasksMax=256", "CPUQuota=100%"] as const;

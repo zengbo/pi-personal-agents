@@ -34,10 +34,9 @@ flowchart LR
     end
     subgraph sbx uid 1001 rootless Podman
       SBXE -->|/run/sbx/podman.sock| C1[(crun 容器)]
-      SBXE -->|/run/sbx/podman-runsc.sock| C2[(gVisor runsc 容器)]
-      C1 & C2 --> WS[/home/sbx/workspaces/bot/session/]
+      C1 --> WS[/home/sbx/workspaces/bot/session/]
     end
-    C1 & C2 -->|pasta 10.0.2.2:8888| TP[tinyproxy 127.0.0.1:8888<br/>域名白名单]
+    C1 -->|pasta 10.0.2.2:8888| TP[tinyproxy 127.0.0.1:8888<br/>域名白名单]
     NFT[nft inet sbx_egress] -.只允许 sbx uid 到 tinyproxy.-> TP
   end
   CTRL -->|ChatGPT OAuth| OAI[api.openai.com]
@@ -93,11 +92,11 @@ sequenceDiagram
 实现 pi-durable `ExecutionEnv` 接口（文件操作 + `exec(command, options, context)`），把调用转发到 per-session 容器。
 
 - `id` = `<bot>/<session>`，相同 id 看到同一份文件（pi-durable 用 id 串行化同一文件的 edit/write）。
-- 工作区：`/home/sbx/workspaces/<bot>/<session>`，叶子目录 0777，父目录 750 + ACL（只给 agentctl 必要的 `x`/`r`），**永不放宽父目录**。
-- 容器参数（两档共用）：`--userns keep-id:uid=1000,gid=1000`、`--cap-drop ALL`、`--security-opt no-new-privileges`、`--read-only`、`--tmpfs /tmp`、`--tmpfs /home/sbx`、`--memory 768m --memory-swap 768m`、`--pids-limit 256`、`--cpus 1`，镜像 `localhost/sandbox-base:1`，网络 pasta，代理 `HTTP(S)_PROXY=http://10.0.2.2:8888`（map-host-loopback）。
-- **两档**：
-  - `crun`（默认）：`/run/sbx/podman.sock`。
-  - `runsc`（不可信代码）：`/run/sbx/podman-runsc.sock`，经 `runsc-rootless` wrapper（`--ignore-cgroups`）。由于 runsc 不自己施加 cgroup 限制，controller 必须：**创建为 paused → `systemctl --user set-property` 设置 libpod-conmon scope 的 `MemoryMax`/`TasksMax`/`CPUQuota` → 再 start**。外层 `user-1001.slice` 有全局上限兜底。
+- 工作区：`/home/sbx/workspaces/<bot>/<session>`。父目录 750 + ACL（只给 agentctl `r`/`x`），**永不放宽父目录**。会话叶子由 sbx helper 创建，模式 `0700`，属主 `sbx`。agentctl 只请求，不 `mkdir`。
+- 容器参数：`--userns keep-id:uid=1000,gid=1000`、`--cap-drop ALL`、`--security-opt no-new-privileges`、`--read-only`、`--tmpfs /tmp`、`--tmpfs /home/sbx`、`--memory 768m --memory-swap 768m`、`--pids-limit 256`、`--cpus 1`，镜像 `localhost/sandbox-base:1`，网络 pasta，代理 `HTTP(S)_PROXY=http://10.0.2.2:8888`（map-host-loopback）。这些限制在 crun 上保持，不因为停用 runsc 而放宽。
+- **运行时**：
+  - `crun`（当前唯一生产档）：`/run/sbx/podman.sock`。create 然后 start。内存 / pids / cpu 由 Podman spec 施加。
+  - `runsc`：controller 不启动，`set_runtime` 选它会被拒绝，直到有一条不经过 agentctl `runuser` 的 set-property 路径。重新启用时必须在 start 之前设置 libpod-conmon scope 的 `MemoryMax=768M`、`TasksMax=256`、`CPUQuota=100%`。主机上的 gVisor socket 可以仍在，供环境脚本检查。外层 `user-1001.slice` 有全局上限兜底。
 - **并发**：最多 3 个运行中容器（3×768m），超出排队（FIFO，带取消）。空闲超时（默认 10 分钟）stop 容器，工作区保留。
 - **文件读取**：controller 侧读取工作区文件时必须用 `openat2(RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS)`；不可用时逐级 `lstat` 拒绝 symlink，并拒绝 `nlink>1` 的普通文件（防硬链接）。优先通过容器内 exec 读写，controller 直接触盘只用于大文件/附件。
 - **replay**：所有 exec 类工具默认不 replay（崩溃后告诉模型“被中断”）；只读工具经测试后可标 `replay:"safe"`。
@@ -110,7 +109,7 @@ sequenceDiagram
 - 决策用 `api.memo("approval:<taskId>")` 持久化，崩溃重放不会重复询问。
 - **只有已认证 Web 会话中的用户点击才算批准**。其他 bot 的消息、工具输出、网页内容中的“已批准”字样一律无效。
 - 审计日志：JSONL 只追加（文件 `chattr +a` 若可用），记录请求、规则命中、决策人、时间。
-- 默认需审批：对外发送（邮件/消息/发帖）、git push、部署、付款、删除工作区外数据、新增出网域名、切换 runsc→crun 档、跨 bot 转发外部通道内容。
+- 默认需审批：对外发送（邮件/消息/发帖）、git push、部署、付款、删除工作区外数据、新增出网域名、`set_runtime`、跨 bot 转发外部通道内容。runsc 当前不可选；请求它会被拒绝。重新启用后，runsc 与 crun 两个方向都要审批。
 
 ### 3.3 bot 间通信
 
@@ -157,9 +156,9 @@ sequenceDiagram
 |---|---|---|
 | Prompt 注入 | 网页/文件内容诱导执行危险工具 | 策略引擎在模型外；危险工具默认 ask；内容标注为数据 |
 | 数据外泄 | 沙箱经 github.com / chatgpt.com 等白名单域名上传数据 | 已知风险：Phase 1 白名单最小化；Phase 3 每 bot 白名单 + 上传类请求审批/大小限制；沙箱无秘密，限制可泄露内容 |
-| 沙箱逃逸 | 内核/crun 漏洞 | rootless + userns + cap-drop + no-new-privileges + read-only；不可信代码走 gVisor；无 KVM 故不用 Firecracker |
+| 沙箱逃逸 | 内核/crun 漏洞 | rootless + userns + cap-drop + no-new-privileges + read-only。runsc 当前不启动；无 KVM 故不用 Firecracker |
 | 符号链接/路径穿越 | 沙箱放 symlink 指向 `/home/agentctl/secrets` | openat2 RESOLVE_BENEATH\|NO_SYMLINKS；父目录 750+ACL |
-| 资源耗尽 | fork 炸弹/内存 | pids 256、768m、cpus 1、并发 3、user-1001.slice 全局上限；runsc 档 scope 属性 |
+| 资源耗尽 | fork 炸弹/内存 | pids 256、768m、cpus 1、并发 3、user-1001.slice 全局上限。crun 用 Podman 的 memory/pids/cpu。runsc 重新启用时还要在 start 前设置 scope 属性 |
 | 冒充审批 | 子 bot 输出“用户已批准” | 审批只来自认证 Web 会话；审计记录决策人 |
 | 跨通道泄露 | 一个通道的内容被转发到另一通道（参考 Grok Bot CFO 事件教训） | 每 bot 独立连接；跨通道转发需显式用户授权规则 |
 | 重放副作用 | 崩溃后重复执行 exec/发送 | exec 默认非 replay-safe；外部动作带幂等键 |
@@ -174,7 +173,7 @@ sequenceDiagram
 | 运行位置 | VPS 原生（systemd） | Cloudflare Workers/DO：exec/文件工具需要远端 env，OAuth 登录仅 Node，CPU/时长限制 |
 | Agent 运行时 | pi-durable（精确锁版本） | 自写循环：要重造检查点/恢复/requestId；LangGraph 等：非 Pi 生态 |
 | 存储 | 每 bot 一个 SQLite | 单库多 bot：单一所有者导致耦合；Postgres：单用户无必要，pi-durable 无现成后端 |
-| 沙箱 | rootless Podman（crun + gVisor） | Firecracker/Kata：无 KVM；NodeExecutionEnv 直接跑：无隔离；Docker rootful：root 守护进程 |
+| 沙箱 | rootless Podman，当前只启用 crun | Firecracker/Kata：无 KVM；NodeExecutionEnv 直接跑：无隔离；Docker rootful：root 守护进程。runsc 等有 set-property 路径再开 |
 | 网络 | nft + tinyproxy 白名单 | 容器全开网：外泄面大；完全断网：researcher 无法工作 |
 | 入口 | cloudflared + Access，只绑 127.0.0.1 | 开放 443 + 自建认证：攻击面大 |
 | 审批 | 模型外策略引擎 + 用户点击 | 模型自审（auto review）：可被注入，且看不到所有副作用 |

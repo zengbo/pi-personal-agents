@@ -63,13 +63,13 @@ WebSocket 任意路径升级，同样要上面的 Origin。客户端发 `{ type:
 
 只有 `actor.kind === "user"` 且带非空 `sessionId` 的决定能通过。其它 bot 的“已批准”会记一条 `untrusted` 审计，不会写规则。`allow_always` 才插入规则。过期或异常都拒绝。决定记在 `api.memo("approval:<taskId>")`，恢复时不重复询问。
 
-`set_runtime` 两个方向都要审批。规格里点名的是 runsc → crun；两个方向都问比放行更严。
+`set_runtime` 仍要审批。runsc 当前不可选：请求 runsc 会被拒绝，不会记成运行时。重新启用之后，规格里的两个方向仍都要审批。
 
 ## 沙箱
 
-并发最多 3。第 4 个进 FIFO 队列，`AbortSignal` 可以取消等待。空闲默认 10 分钟后 stop，工作区保留。runsc 在 start 之前对 `libpod-conmon-<id>.scope` 做 `set-property`（MemoryMax=768M、TasksMax=256、CPUQuota=100%）。失败则 stop 并且不 start。这比 Phase 0 脚本里 set-property 的 `|| true` 更严，不是放宽。
+并发最多 3。第 4 个进 FIFO 队列，`AbortSignal` 可以取消等待。空闲默认 10 分钟后 stop，工作区保留。生产只启动 crun：create 然后 start，不调用 `runuser`，也不做 `set-property`。runsc 在有 set-property 路径之前不启动。crun 的内存、pids、cpu 限制在 Podman spec 上，没有放宽。
 
-容器 spec：`cap_drop: ["ALL"]`、`no_new_privileges`、只读根文件系统、`keep-id:uid=1000,gid=1000`、内存和 swap 各 768MiB、pids 256、cpu quota/period 100000、不继承宿主环境、不挂代理以外的秘密、bind 只挂会话叶子到 `/workspace`。父目录 0750，叶子 0777。已经比 0750 松的父目录直接拒绝，不会 chmod 放宽。
+容器 spec：`cap_drop: ["ALL"]`、`no_new_privileges`、只读根文件系统、`keep-id:uid=1000,gid=1000`、内存和 swap 各 768MiB、pids 256、cpu quota/period 100000、不继承宿主环境、不挂代理以外的秘密、bind 只挂会话叶子到 `/workspace`。父目录 0750，agentctl 只有 `r`/`x` ACL。会话叶子由 sbx helper 创建，模式 `0700`，属主 sbx。已经比 0750 松的父目录直接拒绝，不会 chmod 放宽。controller 不 `mkdir` 叶子，单元的 `ReadWritePaths` 也不包含工作区。
 
 controller 读工作区走 `openat2(RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS)`（通过 `python3` 的 ctypes 调 syscall 437）。内核不支持或没有 python3 时才退回逐级 `lstat`。`..`、符号链接、硬链接（`nlink > 1`）都拒绝，错误里没有文件内容。CI 断言当前内核走的是 openat2。
 

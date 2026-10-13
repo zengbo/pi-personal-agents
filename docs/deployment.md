@@ -10,8 +10,8 @@
 
 | 组件 | 要求 |
 |---|---|
-| Podman | rootless，用户 `sbx`。两个 API socket：`/run/sbx/podman.sock`（crun）、`/run/sbx/podman-runsc.sock`（gVisor） |
-| runsc / gVisor | `/usr/local/bin/runsc-rootless` 的参数里带 `--ignore-cgroups`。runsc 自己不施加 cgroup 限制 |
+| Podman | rootless，用户 `sbx`。controller 只连 `/run/sbx/podman.sock`（crun）。主机上可以仍有 `/run/sbx/podman-runsc.sock`，给 `ops/tests/sandbox-env.sh` 用 |
+| runsc / gVisor | 生产 controller 不启动 runsc，`set_runtime` 选 runsc 会被拒绝。重新启用要等有 set-property 路径，见第 12 节 |
 | nftables | `table inet sbx_egress`：只放行 sbx 相关 uid 访问 `127.0.0.1:8888`，其余出站丢弃 |
 | tinyproxy | 只听 `127.0.0.1:8888`，`FilterDefaultDeny Yes`，再加上域名白名单 |
 | cloudflared | 系统用户 `cloudflared`，把 tunnel 转到本机回环 |
@@ -35,24 +35,69 @@
 
 - `/home/agentctl/data`：`0700`，属主 `agentctl`。每个 bot 一个 SQLite（`chief.sqlite`、`researcher.sqlite`、`ops.sqlite`），加上 `policy.sqlite` 和 `audit.jsonl`。
 - `/home/agentctl/secrets`：`0700`，属主 `agentctl`。`controller.env` 用 `0600`。ChatGPT OAuth 材料也在这里，一个 provider 一个 JSON，写入时是 `0600`。
-- `/home/sbx/workspaces/<bot>/<session>`：父目录属主 `sbx`，模式最多 `0750`。可以给 agentctl 加只含 `r`/`x` 的 ACL。只有会话叶子可以是 `0777`。父目录已经比 `0750` 松时，controller 会拒绝，不会把它 chmod 得更松。在当前 systemd 单元下，agentctl 创建不了这个叶子，见第 12 节。
+- `/home/sbx/workspaces` 和 `/home/sbx/workspaces/<bot>`：属主 `sbx`，模式 `0750`。给 agentctl 的 ACL 只有 `r`/`x`（`setfacl -m u:agentctl:rx`）。父目录已经比 `0750` 松时，helper 拒绝创建叶子，也不会把父目录 chmod 得更松。
+- `/home/sbx/workspaces/<bot>/<session>`：会话叶子。由 sbx helper 创建，模式 `0700`，属主 `sbx`。agentctl 不 `mkdir`。controller 单元的 `ReadWritePaths` 不包含这块路径。
 - `user-1001.slice` 的兜底写在 `/etc/systemd/system/user-1001.slice.d/limits.conf`：`MemoryMax=2600M`、`MemorySwapMax=512M`、`TasksMax=2048`、`CPUQuota=250%`。
 
 创建示例（在 VPS 上，由操作者执行）：
 
 ```bash
 install -d -o agentctl -g agentctl -m 0700 /home/agentctl/data /home/agentctl/secrets
-install -d -o sbx -g sbx -m 0750 /home/sbx/workspaces
+install -d -o sbx -g sbx -m 0750 /home/sbx /home/sbx/workspaces
+for bot in chief researcher ops; do
+  install -d -o sbx -g sbx -m 0750 "/home/sbx/workspaces/$bot"
+done
+setfacl -m u:agentctl:rx /home/sbx /home/sbx/workspaces
+for bot in chief researcher ops; do
+  setfacl -m u:agentctl:rx "/home/sbx/workspaces/$bot"
+done
 ```
 
-`ensureWorkspace` 会尝试创建会话叶子并把它设成 `0777`。当前单元下这一步做不到，见第 12 节。不要把 `/home/agentctl`、Podman socket 或 secrets 挂进容器。
+叶子不在这里创建。下面第 2.1 节的 helper 收到请求后才建 `<session>`，模式 `0700`。不要把 `/home/agentctl`、Podman socket 或 secrets 挂进容器。
+
+crun 的 `--userns keep-id:uid=1000,gid=1000` 在 sbx 的 rootless Podman 里把容器 uid 1000 映到宿主 `sbx`。`0700` 且属主是 `sbx` 的叶子，容器进程能读写。agentctl 不是叶子的属主，父目录 ACL 也没有写，叶子上不加 ACL，所以 controller 进程自己 `open` 这个叶子会得到 `EACCES`。`SandboxExecutionEnv` 的读路径仍是 agentctl 侧的 openat2。这次不把叶子改成 `0777`，也不给 agentctl 加写 ACL。容器里的 exec 走的是容器进程，不受这道宿主叶子权限挡住。
+
+### 2.1 会话叶子 helper
+
+helper 只做一件事：在已经存在的 `<bot>` 父目录下创建或核对一个会话叶子。名字必须是单个路径分量（bot：`^[a-z][a-z0-9-]{0,40}$`，session：`^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$`）。`..`、斜杠、NUL、符号链接都拒绝。创建用 `openat2`（`RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS`）和 `mkdirat`，不用把 `root/bot/session` 拼成一个字符串再 `mkdir`。叶子 `0700`，属主是 helper 进程；单元里 `User=sbx`，所以属主是 `sbx`。父目录不会被 chmod。
+
+agentctl 只往套接字写一行 JSON：`{"bot":"ops","session":"root"}`。成功回答 `{"ok":true}`。失败回答 `{"ok":false,"error":"<code>"}`，`error` 是固定短码，不带路径。
+
+单元文件：
+
+- `ops/systemd/sbx-workspace.socket`
+- `ops/systemd/sbx-workspace.service`
+
+套接字 `/run/sbx/workspace.sock`，`SocketUser=sbx`，`SocketGroup=agentctl`，`SocketMode=0660`。只允许 sbx 和 `agentctl` 组连接。禁止 `0666`、`0662`、`0777` 和 `chmod a+rw`。`/run/sbx` 本身保持 sbx 可进入，不要对其他用户可写。
+
+服务是 `User=sbx`，`NoNewPrivileges=yes`，`ProtectSystem=strict`，`ProtectHome=yes`，`ReadWritePaths=/home/sbx/workspaces`。这行只出现在 helper 单元上。`agentctl-controller.service` 的 `NoNewPrivileges`、`ProtectSystem` 和 `ReadWritePaths` 保持原样，不加入工作区。
+
+脚本放在 `/usr/local/lib`，因为 helper 的 `ProtectHome=yes` 看不到 `/home/agentctl`。安装（在 VPS 上，由操作者执行；先停在第 3 节把代码检出到 `/home/agentctl/app`）：
+
+```bash
+install -d -o root -g root -m 0755 /usr/local/lib/pi-personal-agents
+install -o root -g root -m 0644 \
+  /home/agentctl/app/src/sandbox/workspace-helper.ts \
+  /usr/local/lib/pi-personal-agents/sbx-workspace.ts
+install -o root -g root -m 0644 \
+  /home/agentctl/app/ops/systemd/sbx-workspace.socket \
+  /etc/systemd/system/sbx-workspace.socket
+install -o root -g root -m 0644 \
+  /home/agentctl/app/ops/systemd/sbx-workspace.service \
+  /etc/systemd/system/sbx-workspace.service
+systemctl daemon-reload
+systemctl enable --now sbx-workspace.socket
+```
+
+只 enable socket 单元。systemd 在第一次连接时拉起服务。升级 controller 时把 `sbx-workspace.ts` 按上面的 `install` 再复制一次，然后 `systemctl restart sbx-workspace.socket`。
+
+controller 用 `PPA_WORKSPACE_SOCKET`（默认 `/run/sbx/workspace.sock`）请求叶子。这个变量不是秘密，可以写在 `controller.env`，也可以省略。
 
 ### Podman socket 给 agentctl 的访问
 
-controller 以 `agentctl`（uid 1000）直接连这两个 unix socket（`UnixPodmanClient`）：
+controller 以 `agentctl`（uid 1000）直接连 crun 的 unix socket（`UnixPodmanClient`）：
 
-- `/run/sbx/podman.sock`（crun）
-- `/run/sbx/podman-runsc.sock`（gVisor）
+- `/run/sbx/podman.sock`（crun）。生产启动只走这个 socket。
 
 socket 的属主保持 `sbx`。`agentctl` 的连接权只用下面两种之一：
 
@@ -192,29 +237,21 @@ env | grep '^SBX_' || true
 
 期望没有上面那五个。48 项都通过才算这台机器的沙箱环境可用。CI 不会在 GitHub 上重跑这 48 项。
 
-## 9. runsc 的 set-property 时机
+## 9. 生产只启动 crun
 
-runsc 档的限制不靠 `podman --memory`。`createPodmanDriver` 的顺序是：
+`createPodmanDriver` 的顺序是：
 
-1. `POST /v4.0.0/libpod/containers/create`。容器已创建，尚未 start。命令是 `sleep infinity`。
-2. 仅 runsc：`systemctl --user set-property libpod-conmon-<id>.scope MemoryMax=768M TasksMax=256 CPUQuota=100%`。进程的 uid 不是 1001 时，代码会在前面加上 `runuser -u sbx -- env XDG_RUNTIME_DIR=/run/user/1001`。
-3. 这一步退出码不是 0：stop 并删除该容器，然后抛错，不 start。
-4. 退出码是 0：才 start。
+1. runtime 不是 `crun`：直接抛错 `runsc is disabled until a set-property path exists`。不 create，不 start。
+2. `POST /v4.0.0/libpod/containers/create`，socket 只有 `/run/sbx/podman.sock`。命令是 `sleep infinity`。
+3. start。
 
-验收脚本在 start 之前对 set-property 使用了 `|| true`，那是测试夹具。controller 没有这条放行。
+controller 进程里没有 `runuser`，也没有 `systemctl set-property`。crun 的内存、pids、cpu 限制在 Podman 自己的 spec 上（`src/sandbox/flags.ts`：768MiB、pids 256、cpu quota/period 100000），和 `cap_drop ALL`、`no_new_privileges`、只读根、pasta、tinyproxy 白名单、nft `sbx_egress` 一起保留。
 
-以 `sbx` 的用户会话可以核对 scope 是否在 start 之前就存在（把 `<id>` 换成 create 打印的 id，参数与 `ops/tests/sandbox-env.sh` 的 `HARD_FLAGS` 相同，镜像 `localhost/sandbox-base:1`，命令 `sleep infinity`）：
+`set_runtime` 的参数里仍能写出 `runsc`，这样模型选它时会拿到上面那句拒绝，而不是静默切换。工具实现和 `beforeTool` 都不会把 runtime 记成 runsc。`set_runtime` 仍在危险工具名单里；目标是 `crun` 时仍要审批。
 
-```bash
-# podman create（不要 start）之后立刻，在 sbx 的用户会话里：
-systemctl --user status "libpod-conmon-<id>.scope"
-systemctl --user set-property "libpod-conmon-<id>.scope" \
-  MemoryMax=768M TasksMax=256 CPUQuota=100%
-```
+`ops/tests/sandbox-env.sh` 仍会在主机上检查 runsc 那一组 T1–T6 和 H6/H8。那是主机环境脚本，不是 controller 的启动路径。脚本里对 scope 属性的 `|| true` 仍是测试夹具。
 
-scope 在 start 之前不存在时，删掉这个容器，不要 start。这次核对只说明主机上的 scope 时机。它不能说明 `agentctl` 服务里的 `runuser -u sbx` 会成功。
-
-服务实际跑不起来：单元是 `User=agentctl`（uid 1000）并且 `NoNewPrivileges=yes`。`runuser` 要换成 uid 1001，在这个限制下失败。set-property 失败后容器被 stop，runsc 档不会 start。这是未解决项，部署前必须先定，见第 12 节。
+重新启用 runsc 要先有一条不经过 agentctl `runuser` 的 set-property 路径，并且在 start 之前加上 `MemoryMax=768M`、`TasksMax=256`、`CPUQuota=100%`（`RUNSC_SCOPE_PROPERTIES`）。在那之前 runsc 不可选。见第 12 节。
 
 同时看第 4 节，确认镜像里有 `bash` 和 `sleep`。
 
@@ -228,6 +265,10 @@ cd /home/agentctl/app
 git fetch
 git checkout <要运行的提交>
 npm ci
+install -o root -g root -m 0644 \
+  src/sandbox/workspace-helper.ts \
+  /usr/local/lib/pi-personal-agents/sbx-workspace.ts
+systemctl restart sbx-workspace.socket
 systemctl start agentctl-controller
 ```
 
@@ -250,38 +291,25 @@ journalctl -u agentctl-controller -e
 | `missing CLOUDFLARE_ACCESS_AUD`（或其它 `missing …`） | `controller.env` 少了必填变量，或文件权限让 `agentctl` 读不到 |
 | `access jwks request failed` / `access jwks had no rsa keys` | 第一次拉取失败，进程退出。检查 `CLOUDFLARE_ACCESS_JWKS_URL` 从这台机器是否可达 |
 | `jwks refresh failed: …` | 运行中的刷新失败。这一行只会出现固定短句（`access jwks request failed`、`access jwks had no rsa keys` 或 `request failed`），不会带上 token、cookie 或完整 URL。已有密钥还留着 |
-| `runsc limits were not applied; container was not started` | runsc 的 `set-property` 失败。容器已 stop，没有 start。在当前单元里，uid 1000 的 `runuser -u sbx` 会走这条失败，见第 12 节 |
+| `runsc is disabled until a set-property path exists` | 有人请求了 runsc。容器没有 create。见第 9 节 |
 | `sandbox stop failed: <id>` | 空闲容器 stop 失败。`<id>` 只是容器 id。槽位仍会释放。这一行没有命令输出，也没有环境变量 |
 | `listening` 之后浏览器 401 | Access JWT 的 `aud`、`iss`、`email` 与环境变量不一致，或 `email` 不是 `PPA_OWNER_EMAIL` |
 | 浏览器 403 | POST 或 WebSocket 的 `Origin` 不是 `https://<CLOUDFLARED_HOSTNAME>` |
 
 cloudflared 自身的日志用它的系统单元看（常见是 `journalctl -u cloudflared`）。tunnel 通、本机 `curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8787/` 在没有 JWT 时是 `401`，说明 controller 在听，并且没有把页面暴露成匿名可读。
 
-## 12. 未解决，部署前必须先定
+## 12. 部署阻塞项
 
-下面两件事主人还没有选定做法。候选并列在这里，也写在 [docs/follow-ups.md](follow-ups.md)。候选都不改这三项：`NoNewPrivileges` 保持 `yes`，`ProtectSystem` 保持 `strict`，工作区父目录保持最多 `0750`、agentctl 只有 `r`/`x`。
+下面两件主人已经选定。`NoNewPrivileges` 仍是 `yes`，`ProtectSystem` 仍是 `strict`，工作区父目录仍是最多 `0750`、agentctl 只有 `r`/`x`。controller 的 `ReadWritePaths` 仍只有 `/home/agentctl/data` 和 `/home/agentctl/secrets`。
 
-### runsc 容器起不来
+### runsc：先只用 crun
 
-`createPodmanDriver` 在 uid 不是 1001 时用 `runuser -u sbx` 执行 `systemctl --user set-property`。服务用户是 `agentctl`（uid 1000），单元又有 `NoNewPrivileges=yes`，这次 `runuser` 失败。失败则 stop 并且不 start，所以 runsc 档没有容器能跑起来。crun 档不走 `runuser`，它只依赖第 2 节的 socket 权限。
+生产 runtime 默认并且只有 crun。runsc 不可选。`set_runtime` 请求 runsc 时拒绝，消息是 `runsc is disabled until a set-property path exists`。启动流程里没有 `runuser`，也没有 `set-property`。crun 容器保持原有限制：`cap_drop ALL`、`no_new_privileges`、只读根、内存 / pids / cpu 走 Podman 自己的参数、pasta、tinyproxy 白名单、nft。
 
-候选：
+重新启用 runsc 是后续，不是现在的缺口。要有一条不从 agentctl 进程 `runuser` 的 set-property 路径，并在 start 之前加上 `MemoryMax=768M`、`TasksMax=256`、`CPUQuota=100%`。见 [docs/follow-ups.md](follow-ups.md)。
 
-- 单独一个 `User=sbx` 的辅助单元，在 sbx 自己的用户会话里执行 `set-property`。agentctl 把容器 id 交给它，交接用的本地套接字只允许 `agentctl` 连接。
-- 把 `set-property` 放在 sbx 已经拥有的用户会话里完成，agentctl 进程里不调用 `runuser`。
-- 在这件事情定下来之前，只启用 crun 档。
+### 会话叶子：sbx helper 创建
 
-### 会话工作区叶子创建不了
+叶子由 `User=sbx` 的 socket 激活服务创建，模式 `0700`，属主 `sbx`。校验是 openat，拒绝 `..` 和符号链接。agentctl 只发请求。父目录保持 sbx `0750` 加 agentctl 的 `r`/`x` ACL。安装步骤在第 2.1 节。
 
-两件事实叠在一起：
-
-- 单元是 `ProtectSystem=strict`，`ReadWritePaths` 只有 `/home/agentctl/data` 和 `/home/agentctl/secrets`。
-- `/home/sbx/workspaces` 和 `<bot>` 父目录属主是 `sbx`，模式 `0750`，agentctl 的 ACL 只有 `r`/`x`。
-
-`ensureWorkspace` 要在这个父目录下创建 `<session>` 叶子。服务进程既写不进这块路径，也没有在父目录里建目录的权限。
-
-候选：
-
-- 由 uid 1001 的辅助进程创建叶子并设成 `0777`。agentctl 只使用已经存在的叶子。
-- 部署时由 `sbx` 为会用到的会话预先建好叶子，至少包括每个 bot 的 root 会话。
-- 叶子不存在时由 sbx 的用户会话创建；controller 在叶子缺失时失败并记日志，不自己 `mkdir`。
+retry 仍是 `{ enabled: false, maxRetries: 0, baseDelayMs: 0 }`，这项还待确认，和上面两件无关。
