@@ -1,6 +1,6 @@
 # 后续
 
-Phase 1 评审时记下的后续。沙箱边界保持原样。上下文压缩已经用 pi-durable 的内置策略做完。主人接受继续搁置的是：ops 的 exec 可以绕过 `git_push` 审批，以及会话列表只有 root。retry 仍关闭，这项待确认。部署还有两件必须先定的事，见文末。
+Phase 1 评审时记下的后续。沙箱边界保持原样。上下文压缩已经用 pi-durable 的内置策略做完。主人接受继续搁置的是：ops 的 exec 可以绕过 `git_push` 审批，以及会话列表只有 root。retry 仍关闭，这项待确认。原先两个部署阻塞项已经按文末的选择解决。
 
 ## ops 的 exec 可以绕过 git_push
 
@@ -24,30 +24,24 @@ Phase 1 评审时记下的后续。沙箱边界保持原样。上下文压缩已
 
 未完成的审批卡只在进程内存里。崩溃后这些卡消失，恢复时按拒绝处理（fail-closed），不会当成已批准。
 
-## set_runtime 两个方向都要审批
+## set_runtime
 
-规格点名的是 runsc → crun。实现里换回 runsc 也要审批。两个方向都问，比规格更严。
+规格点名的是 runsc → crun，两个方向都要审批。现在 runsc 不可选，所以没有方向可切。`set_runtime` 仍在危险工具名单里；请求 crun 仍要审批。请求 runsc 直接拒绝，消息是 `runsc is disabled until a set-property path exists`。重新启用之后，两个方向仍要审批。
 
-## 未解决，部署前必须先定
+## 部署阻塞项已按这个选择解决
 
-细节和操作说明在 [docs/deployment.md](deployment.md) 第 12 节。候选都不改这三项：`NoNewPrivileges` 保持 `yes`，`ProtectSystem` 保持 `strict`，工作区父目录保持最多 `0750`、agentctl 只有 `r`/`x`。下面不选定哪一条。
+细节在 [docs/deployment.md](deployment.md) 第 12 节和第 2.1 节。`NoNewPrivileges` 保持 `yes`，`ProtectSystem` 保持 `strict`，工作区父目录保持最多 `0750`、agentctl 只有 `r`/`x`。controller 的 `ReadWritePaths` 没有工作区。
 
-### runsc 的 set-property
+### 只用 crun
 
-`createPodmanDriver` 在 uid 不是 1001 时用 `runuser -u sbx` 执行 `systemctl --user set-property`。服务是 `User=agentctl`（uid 1000）并且 `NoNewPrivileges=yes`，这次 `runuser` 失败。失败则容器被 stop 且不会 start，所以 runsc 档起不来。
+生产默认 runtime 是 crun，也是唯一会启动的 runtime。启动流程不调用 `runuser`，也不做 `set-property`。crun 的 `cap_drop ALL`、`no_new_privileges`、只读根、内存 / pids / cpu（Podman 自己的参数）、pasta、tinyproxy 白名单、nft 都保持。
 
-候选：
+### runsc 重新启用（后续）
 
-- 单独一个 `User=sbx` 的辅助单元，在 sbx 自己的用户会话里执行 `set-property`。agentctl 把容器 id 交给它，交接用的本地套接字只允许 `agentctl` 连接。
-- 把 `set-property` 放在 sbx 已经拥有的用户会话里完成，agentctl 进程里不调用 `runuser`。
-- 在这件事情定下来之前，只启用 crun 档。
+要有一条不从 agentctl 进程 `runuser` 的 set-property 路径，并在 start 之前设置 `MemoryMax=768M`、`TasksMax=256`、`CPUQuota=100%`（`RUNSC_SCOPE_PROPERTIES`）。在那之前 runsc 不能被选中，也不能启动。
 
-### 会话工作区叶子
+### 会话叶子由 sbx helper 创建
 
-`ProtectSystem=strict` 的 `ReadWritePaths` 没有 `/home/sbx/workspaces`。父目录属主是 `sbx`、模式 `0750`，agentctl 只有 `r`/`x` ACL。`ensureWorkspace` 因此创建不了 `<bot>/<session>` 叶子。
+`sbx-workspace.socket` 拉起 `User=sbx` 的服务。它只用 openat 在 `/home/sbx/workspaces/<bot>` 下创建会话叶子，模式 `0700`，属主 sbx。agentctl 只发请求。父目录仍是 sbx `0750` 加 agentctl 的 `r`/`x` ACL。
 
-候选：
-
-- 由 uid 1001 的辅助进程创建叶子并设成 `0777`。agentctl 只使用已经存在的叶子。
-- 部署时由 `sbx` 为会用到的会话预先建好叶子，至少包括每个 bot 的 root 会话。
-- 叶子不存在时由 sbx 的用户会话创建；controller 在叶子缺失时失败并记日志，不自己 `mkdir`。
+叶子是 `0700`、属主 sbx。crun 的 `keep-id:uid=1000,gid=1000` 在 sbx 跑 Podman 时，容器 uid 1000 对应宿主 sbx，所以容器能写这个叶子。会话文件的读、写、列目录、改名和 flush 都在容器里经 exec 完成（不超过 8 MiB 的 `head -c`、原始 stdin 上的 `tee`、`find` / `stat` / `mv`）。路径限制在 `/workspace`，拒绝 `..` 和越界绝对路径，`realpath` 必须落在 `/workspace` 下面。超过 8 MiB 返回 `too_large`。不把叶子改松，也不给 agentctl 加 ACL。agentctl 不在宿主上打开叶子。

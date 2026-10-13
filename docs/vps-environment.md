@@ -23,14 +23,14 @@
 | `cloudflared` | system | tunnel |
 | build 用户 | — | 维护窗口内重建沙箱镜像 |
 
-工作区：`/home/sbx/workspaces/<bot>/<session>`，叶子 0777，父目录 750 + ACL。**永不放宽父目录。**
+工作区：`/home/sbx/workspaces/<bot>/<session>`。父目录 750 + ACL，**永不放宽**。当前生产叶子是 `0700`、属主 `sbx`，由 sbx helper 创建。下面第 5 节里的 `0777` 是当时为 gVisor `nobody` 记下的实测，不是现在的叶子模式。
 
 ## 3. 容器运行时
 
 | Socket | 运行时 | 用途 |
 |---|---|---|
-| `/run/sbx/podman.sock` | crun | 默认档 |
-| `/run/sbx/podman-runsc.sock` | gVisor（`runsc-rootless` wrapper，`--ignore-cgroups`） | 不可信代码 |
+| `/run/sbx/podman.sock` | crun | 当前唯一生产档 |
+| `/run/sbx/podman-runsc.sock` | gVisor（`runsc-rootless` wrapper，`--ignore-cgroups`） | 主机上可留着给环境脚本。controller 不连接、不启动 |
 
 镜像：`localhost/sandbox-base:1`。
 
@@ -46,10 +46,7 @@
 -e HTTP_PROXY=http://10.0.2.2:8888 -e HTTPS_PROXY=http://10.0.2.2:8888
 ```
 
-runsc 档资源限制流程（wrapper `/usr/local/bin/runsc-rootless` 带 `--ignore-cgroups`，runsc 自身不施加限制）：
-1. 以 paused 状态创建容器；
-2. `systemctl --user set-property libpod-conmon-<id>.scope MemoryMax=768M TasksMax=256 CPUQuota=100%`；
-3. start。
+runsc 档的历史限制流程（wrapper `/usr/local/bin/runsc-rootless` 带 `--ignore-cgroups`，runsc 自身不施加限制）是：paused 创建，然后 `systemctl --user set-property libpod-conmon-<id>.scope MemoryMax=768M TasksMax=256 CPUQuota=100%`，再 start。生产 controller 现在不走这条路径，也不从 agentctl 进程 `runuser`。重新启用前必须先有 set-property 路径。crun 的内存 / pids / cpu 仍由 Podman 自己的参数施加。
 
 全局兜底：`user-1001.slice` 限制（见第 5 节）。
 
@@ -74,7 +71,7 @@ runsc 档资源限制流程（wrapper `/usr/local/bin/runsc-rootless` 带 `--ign
 | T3c | pids 限制未生效 | 同上 |
 | T3e | cpus 限制未生效 | 同上 |
 
-**修复**：controller 对 `libpod-conmon-<id>.scope` 执行 `systemctl --user set-property`，设置 `MemoryMax` / `TasksMax` / `CPUQuota`。
+**当时的修复**：在 start 之前对 `libpod-conmon-<id>.scope` 执行 `systemctl --user set-property`，设置 `MemoryMax` / `TasksMax` / `CPUQuota`。这条路径没有接进现在的 controller：agentctl 在 `NoNewPrivileges=yes` 下不能 `runuser` 到 sbx。生产因此只启动 crun。
 
 **复测结果**：
 - T3a：内存超限，退出码 137，`OOMKilled=true` → PASS
@@ -95,14 +92,14 @@ CPUQuota=250%
 
 - **T5a**：以代理 CONNECT 返回状态 200 判定通过。
 - **T8**：标准放宽为 `used < 3000 MiB` 且 sshd 存活。实测 3×768m 并发时 used 2752M、avail 1157M。
-- **工作区叶子目录 0777**：gVisor rootless 下主机文件在容器内显示为 `nobody`，因此叶子目录需 0777。父目录仍为 750 + ACL，不得放宽。
+- **工作区叶子目录当时是 0777**：gVisor rootless 下主机文件在容器内显示为 `nobody`，所以当时叶子是 0777。runsc 停用之后，叶子改为 `0700`、属主 `sbx`。父目录仍为 750 + ACL，不得放宽。环境脚本 H15 现在要求叶子是 `0700`。
 - **crun 档必须带 `--userns keep-id`**。
 
 ## 6. 回归检查清单（每次变更后）
 
 - [ ] 容器内 `id` 显示 uid 1000 映射、无 capabilities（`capsh --print` 为空）
 - [ ] `/` 只读；`/tmp`、`/home/sbx` 可写
-- [ ] 超过 768m 被 OOM kill；fork 超过 256 失败；CPU ≤ 1 核（crun 与 runsc 两档）
+- [ ] 超过 768m 被 OOM kill；fork 超过 256 失败；CPU ≤ 1 核（生产 crun 档由 Podman 参数施加；runsc 档仍在环境脚本里，controller 不启动它）
 - [ ] 直接连外网失败；经代理访问白名单域名成功、非白名单 403
 - [ ] 工作区 symlink 指向 `/home/agentctl` 时 controller 读取被拒绝
 - [ ] 容器内看不到 Podman socket、`/home/agentctl`、任何秘密

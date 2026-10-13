@@ -2,7 +2,6 @@
  * Process entry for the systemd unit (`node --experimental-strip-types src/controller.ts`).
  * Importing this module does not open sockets; the guard below does.
  */
-import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import { pathToFileURL } from "node:url";
@@ -15,7 +14,7 @@ import { BOTS } from "./bots/extensions.ts";
 import { AuditLog } from "./policy/audit.ts";
 import { PolicyEngine } from "./policy/engine.ts";
 import { PolicyStore } from "./policy/store.ts";
-import { createPodmanDriver, UnixPodmanClient, type CommandRunner } from "./sandbox/podman.ts";
+import { createPodmanDriver, UnixPodmanClient } from "./sandbox/podman.ts";
 import { SandboxPool } from "./sandbox/pool.ts";
 import type { AccessCheck, AccessKey } from "./web/access.ts";
 import { JwksCache } from "./web/jwks.ts";
@@ -29,6 +28,7 @@ async function main(): Promise<void> {
   const dataDir = process.env.PPA_DATA_DIR ?? "/home/agentctl/data";
   const secretsDir = process.env.PPA_SECRETS_DIR ?? "/home/agentctl/secrets";
   const workspaceRoot = process.env.PPA_WORKSPACE_ROOT ?? "/home/sbx/workspaces";
+  const workspaceSocket = process.env.PPA_WORKSPACE_SOCKET ?? "/run/sbx/workspace.sock";
   const port = Number(process.env.PPA_PORT ?? "8787");
   const access: AccessCheck = {
     audience,
@@ -55,12 +55,12 @@ async function main(): Promise<void> {
   const engine = new PolicyEngine(new PolicyStore(`${dataDir}/policy.sqlite`), audit);
   const client = new UnixPodmanClient({
     crun: "/run/sbx/podman.sock",
-    runsc: "/run/sbx/podman-runsc.sock",
   });
-  const pool = new SandboxPool(createPodmanDriver(client, sbxRunner()));
+  const pool = new SandboxPool(createPodmanDriver(client));
   const controller = await startController({
     dataDir,
     workspaceRoot,
+    workspaceSocket,
     port,
     access,
     modelsFor: () => models,
@@ -71,24 +71,6 @@ async function main(): Promise<void> {
     login,
   });
   process.stdout.write(`listening 127.0.0.1:${controller.port} bots=${BOTS.join(",")}\n`);
-}
-
-function sbxRunner(): CommandRunner {
-  return {
-    run(argv) {
-      const prefix =
-        process.getuid?.() === 1001 ? [...argv] : ["runuser", "-u", "sbx", "--", "env", "XDG_RUNTIME_DIR=/run/user/1001", ...argv];
-      const [bin, ...args] = prefix;
-      if (bin === undefined) {
-        return Promise.resolve({ code: 1 });
-      }
-      return new Promise((resolve) => {
-        const child = spawn(bin, args, { stdio: "ignore" });
-        child.once("error", () => resolve({ code: 1 }));
-        child.once("exit", (code) => resolve({ code: code ?? 1 }));
-      });
-    },
-  };
 }
 
 async function loadJwks(url: string): Promise<AccessKey[]> {

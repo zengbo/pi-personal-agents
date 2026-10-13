@@ -1,5 +1,4 @@
 import type { Context } from "@earendil-works/chord";
-import fs from "node:fs";
 import path from "node:path";
 import {
   ExecutionError,
@@ -10,6 +9,7 @@ import {
   type DirReader,
   type ExecutionEnv,
   type FileInfo,
+  type FileKind,
   type FileWatcher,
   type Result,
   type ShellExecOptions,
@@ -19,12 +19,30 @@ import {
   type WatchChange,
   type WatchTarget,
 } from "@earendil-works/pi-durable/env";
-import { SANDBOX_PROXY_ENV } from "./flags.ts";
-import type { PodmanClient } from "./podman.ts";
+import { MAX_FILE_BYTES, SANDBOX_PROXY_ENV } from "./flags.ts";
+import {
+  CONTAINER_WORKSPACE,
+  confineWorkspacePath,
+  fileOpArgv,
+} from "./file-op.ts";
+import { PodmanOutputTooLargeError, type PodmanClient, type PodmanExecResult } from "./podman.ts";
 import type { SandboxPool, SandboxSession } from "./pool.ts";
-import { PathEscapeError, readWorkspaceFile } from "./workspace-read.ts";
 
 const SECRET_NAME = /token|secret|password|passwd|cookie|authorization|api[_-]?key|credential/i;
+const OP_CODES = new Set([
+  "escape",
+  "dotdot",
+  "nul",
+  "symlink",
+  "hardlink",
+  "not_found",
+  "not_file",
+  "not_directory",
+  "invalid",
+  "unknown",
+  "root",
+  "too_large",
+]);
 
 export function containerEnv(extra: Readonly<Record<string, string>> | undefined): Record<string, string> {
   const env: Record<string, string> = { ...SANDBOX_PROXY_ENV };
@@ -42,7 +60,7 @@ export function containerEnv(extra: Readonly<Record<string, string>> | undefined
 
 /**
  * One conversation's files and shell. `id` is `<bot>/<session>`.
- * Reads use openat2. Exec goes through the pool and never inherits the controller environment.
+ * Every file operation is a container exec. This process does not open the leaf.
  */
 export class SandboxExecutionEnv implements ExecutionEnv {
   readonly id: string;
@@ -56,12 +74,12 @@ export class SandboxExecutionEnv implements ExecutionEnv {
     this.client = client;
     this.session = session;
     this.id = `${session.bot}/${session.session}`;
-    this.cwd = "/workspace";
+    this.cwd = CONTAINER_WORKSPACE;
   }
 
   async absolutePath(input: string, _context: Context): Promise<Result<string, FileError>> {
     try {
-      return ok(this.containerPath(input));
+      return ok(confineWorkspacePath(this.cwd, input));
     } catch (error) {
       return err(asFileError(error, input));
     }
@@ -79,13 +97,8 @@ export class SandboxExecutionEnv implements ExecutionEnv {
     return ok(new TextDecoder().decode(binary.value));
   }
 
-  async readBinaryFile(filePath: string, _context: Context): Promise<Result<Uint8Array, FileError>> {
-    try {
-      const host = this.hostFile(filePath);
-      return ok(readWorkspaceFile(this.session.workspaceLeaf, host.relative));
-    } catch (error) {
-      return err(asFileError(error, filePath));
-    }
+  async readBinaryFile(filePath: string, context: Context): Promise<Result<Uint8Array, FileError>> {
+    return this.runOp("read", filePath, undefined, undefined, context);
   }
 
   async readTextLines(filePath: string, options: { maxLines?: number } | undefined, context: Context): Promise<Result<string[], FileError>> {
@@ -142,90 +155,115 @@ export class SandboxExecutionEnv implements ExecutionEnv {
     });
   }
 
-  async writeFile(filePath: string, content: string | Uint8Array, _context: Context): Promise<Result<void, FileError>> {
-    return this.mutate(filePath, (host) => {
-      const data = typeof content === "string" ? Buffer.from(content) : Buffer.from(content);
-      const fd = fs.openSync(host, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC | fs.constants.O_NOFOLLOW, 0o644);
-      try {
-        fs.writeFileSync(fd, data);
-      } finally {
-        fs.closeSync(fd);
-      }
-    });
-  }
-
-  async appendFile(filePath: string, content: string | Uint8Array, _context: Context): Promise<Result<void, FileError>> {
-    return this.mutate(filePath, (host) => {
-      const data = typeof content === "string" ? Buffer.from(content) : Buffer.from(content);
-      const fd = fs.openSync(host, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_APPEND | fs.constants.O_NOFOLLOW, 0o644);
-      try {
-        fs.writeFileSync(fd, data);
-      } finally {
-        fs.closeSync(fd);
-      }
-    });
-  }
-
-  async truncateFile(filePath: string, size: number, _context: Context): Promise<Result<void, FileError>> {
-    return this.mutate(filePath, (host) => {
-      const fd = fs.openSync(host, fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW);
-      try {
-        fs.ftruncateSync(fd, size);
-      } finally {
-        fs.closeSync(fd);
-      }
-    });
-  }
-
-  async flushFile(filePath: string, _context: Context): Promise<Result<void, FileError>> {
-    return this.mutate(filePath, (host) => {
-      const fd = fs.openSync(host, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
-      try {
-        fs.fsyncSync(fd);
-      } finally {
-        fs.closeSync(fd);
-      }
-    });
-  }
-
-  async renameFile(sourcePath: string, destinationPath: string, _context: Context): Promise<Result<void, FileError>> {
-    try {
-      const source = this.hostFile(sourcePath);
-      const destination = this.hostFile(destinationPath);
-      this.assertParentsReal(destination.relative);
-      fs.renameSync(source.absolute, destination.absolute);
-      return ok(undefined);
-    } catch (error) {
-      return err(asFileError(error, sourcePath));
+  async writeFile(filePath: string, content: string | Uint8Array, context: Context): Promise<Result<void, FileError>> {
+    const bytes = toBytes(content);
+    if (bytes.byteLength > MAX_FILE_BYTES) {
+      return err(new FileError("invalid", "too_large", filePath));
     }
+    const wrote = await this.runOp("write", filePath, bytes, undefined, context);
+    return wrote.ok ? ok(undefined) : wrote;
   }
 
-  async fileInfo(filePath: string, _context: Context): Promise<Result<FileInfo, FileError>> {
-    try {
-      const host = this.hostFile(filePath);
-      const stat = fs.lstatSync(host.absolute);
-      if (stat.isSymbolicLink()) {
-        return err(new FileError("invalid", "symlink", filePath));
-      }
-      return ok(toInfo(host.container, stat));
-    } catch (error) {
-      return err(asFileError(error, filePath));
+  async appendFile(filePath: string, content: string | Uint8Array, context: Context): Promise<Result<void, FileError>> {
+    const bytes = toBytes(content);
+    if (bytes.byteLength > MAX_FILE_BYTES) {
+      return err(new FileError("invalid", "too_large", filePath));
     }
+    const wrote = await this.runOp("append", filePath, bytes, undefined, context);
+    return wrote.ok ? ok(undefined) : wrote;
   }
 
-  async listDir(dirPath: string, _context: Context): Promise<Result<FileInfo[], FileError>> {
+  async truncateFile(filePath: string, size: number, context: Context): Promise<Result<void, FileError>> {
+    if (!Number.isInteger(size) || size < 0) {
+      return err(new FileError("invalid", "invalid", filePath));
+    }
+    const truncated = await this.runOp("truncate", filePath, undefined, String(size), context);
+    return truncated.ok ? ok(undefined) : truncated;
+  }
+
+  async flushFile(filePath: string, context: Context): Promise<Result<void, FileError>> {
+    const flushed = await this.runOp("flush", filePath, undefined, undefined, context);
+    return flushed.ok ? ok(undefined) : flushed;
+  }
+
+  async renameFile(sourcePath: string, destinationPath: string, context: Context): Promise<Result<void, FileError>> {
+    let destination: string;
     try {
-      const host = this.hostDir(dirPath);
-      const names = fs.readdirSync(host.absolute);
-      const entries: FileInfo[] = [];
-      for (const name of names) {
-        const stat = fs.lstatSync(path.join(host.absolute, name));
-        entries.push(toInfo(path.posix.join(host.container, name), stat));
-      }
+      destination = confineWorkspacePath(this.cwd, destinationPath);
+    } catch (error) {
+      return err(asFileError(error, destinationPath));
+    }
+    const renamed = await this.runOp("rename", sourcePath, undefined, destination, context);
+    return renamed.ok ? ok(undefined) : renamed;
+  }
+
+  async fileInfo(filePath: string, context: Context): Promise<Result<FileInfo, FileError>> {
+    const container = this.tryConfine(filePath);
+    if (!container.ok) {
+      return container;
+    }
+    const stat = await this.runOp("stat", container.value, undefined, undefined, context);
+    if (!stat.ok) {
+      return stat;
+    }
+    const line = Buffer.from(stat.value).toString("utf8").trim();
+    const match = /^(file|directory) (\d+) (\d+)$/.exec(line);
+    if (match === null) {
+      return err(new FileError("unknown", "unknown", filePath));
+    }
+    const kind = match[1];
+    const size = match[2];
+    const mtime = match[3];
+    if ((kind !== "file" && kind !== "directory") || size === undefined || mtime === undefined) {
+      return err(new FileError("unknown", "unknown", filePath));
+    }
+    return ok({
+      name: path.posix.basename(container.value),
+      path: container.value,
+      kind,
+      size: Number(size),
+      mtimeMs: Number(mtime) * 1000,
+    });
+  }
+
+  async listDir(dirPath: string, context: Context): Promise<Result<FileInfo[], FileError>> {
+    const container = this.tryConfine(dirPath);
+    if (!container.ok) {
+      return container;
+    }
+    const listed = await this.runOp("list", container.value, undefined, undefined, context);
+    if (!listed.ok) {
+      return listed;
+    }
+    const text = Buffer.from(listed.value).toString("utf8");
+    const entries: FileInfo[] = [];
+    const parts = text.split("\0");
+    if (parts.length > 0 && parts[parts.length - 1] === "") {
+      parts.pop();
+    }
+    if (parts.length === 0) {
       return ok(entries);
-    } catch (error) {
-      return err(asFileError(error, dirPath));
     }
+    if (parts.length % 4 !== 0) {
+      return err(new FileError("unknown", "unknown", dirPath));
+    }
+    for (let index = 0; index < parts.length; index += 4) {
+      const name = parts[index];
+      const kind = parts[index + 1];
+      const size = parts[index + 2];
+      const mtime = parts[index + 3];
+      if (name === undefined || name.length === 0 || !isKind(kind) || size === undefined || mtime === undefined || !/^\d+$/.test(size) || !/^\d+$/.test(mtime)) {
+        return err(new FileError("unknown", "unknown", dirPath));
+      }
+      entries.push({
+        name,
+        path: path.posix.join(container.value, name),
+        kind,
+        size: Number(size),
+        mtimeMs: Number(mtime) * 1000,
+      });
+    }
+    return ok(entries);
   }
 
   async openDirReader(dirPath: string, context: Context): Promise<Result<DirReader, FileError>> {
@@ -245,28 +283,41 @@ export class SandboxExecutionEnv implements ExecutionEnv {
     });
   }
 
-  async watch(targets: readonly WatchTarget[], onChange: (change: WatchChange) => void, _context: Context): Promise<Result<FileWatcher, FileError>> {
-    const watchers: fs.FSWatcher[] = [];
-    try {
-      for (const target of targets) {
-        const host = this.hostDir(target.path);
-        const watcher = fs.watch(host.absolute, { recursive: target.recursive === true }, () => {
-          onChange({ paths: [target.path] });
-        });
-        watchers.push(watcher);
+  async watch(targets: readonly WatchTarget[], onChange: (change: WatchChange) => void, context: Context): Promise<Result<FileWatcher, FileError>> {
+    for (const target of targets) {
+      const confined = this.tryConfine(target.path);
+      if (!confined.ok) {
+        return confined;
       }
-    } catch (error) {
-      for (const watcher of watchers) {
-        watcher.close();
-      }
-      return err(asFileError(error, targets[0]?.path ?? "/workspace"));
     }
-    return ok({
-      mode: "native",
-      close: () => {
-        for (const watcher of watchers) {
-          watcher.close();
+    const snapshots = new Map<string, string>();
+    let closed = false;
+    const poll = async (): Promise<void> => {
+      if (closed) {
+        return;
+      }
+      for (const target of targets) {
+        const listed = await this.listDir(target.path, context);
+        const signature = listed.ok
+          ? listed.value.map((entry) => `${entry.path}\t${entry.kind}\t${entry.size}\t${entry.mtimeMs}`).join("\n")
+          : `missing:${listed.error.code}`;
+        const previous = snapshots.get(target.path);
+        snapshots.set(target.path, signature);
+        if (!closed && previous !== undefined && previous !== signature) {
+          onChange({ paths: [target.path] });
         }
+      }
+    };
+    await poll();
+    const timer = setInterval(() => {
+      void poll().catch(() => undefined);
+    }, 500);
+    timer.unref();
+    return ok({
+      mode: "polling",
+      close: () => {
+        closed = true;
+        clearInterval(timer);
         return Promise.resolve();
       },
     });
@@ -276,65 +327,60 @@ export class SandboxExecutionEnv implements ExecutionEnv {
     return this.absolutePath(filePath, context);
   }
 
-  async exists(filePath: string, _context: Context): Promise<Result<boolean, FileError>> {
-    try {
-      const host = this.hostFile(filePath);
-      return ok(fs.existsSync(host.absolute));
-    } catch (error) {
-      if (error instanceof FileError && error.code === "invalid") {
-        return err(error);
+  async exists(filePath: string, context: Context): Promise<Result<boolean, FileError>> {
+    const result = await this.runOp("exists", filePath, undefined, undefined, context);
+    if (!result.ok) {
+      if (result.error.code === "not_found") {
+        return ok(false);
       }
-      return ok(false);
+      return result;
     }
+    return ok(Buffer.from(result.value).toString("utf8").trim() === "yes");
   }
 
-  async createDir(dirPath: string, options: { recursive?: boolean } | undefined, _context: Context): Promise<Result<void, FileError>> {
-    try {
-      const host = this.hostDir(dirPath);
-      this.assertParentsReal(path.posix.dirname(host.relative));
-      fs.mkdirSync(host.absolute, { recursive: options?.recursive === true });
-      return ok(undefined);
-    } catch (error) {
-      return err(asFileError(error, dirPath));
-    }
+  async createDir(dirPath: string, options: { recursive?: boolean } | undefined, context: Context): Promise<Result<void, FileError>> {
+    const created = await this.runOp("mkdir", dirPath, undefined, options?.recursive === true ? "recursive" : "plain", context);
+    return created.ok ? ok(undefined) : created;
   }
 
-  async remove(filePath: string, options: { recursive?: boolean; force?: boolean } | undefined, _context: Context): Promise<Result<void, FileError>> {
-    try {
-      const host = this.hostFile(filePath);
-      if (host.relative.length === 0) {
-        return err(new FileError("invalid", "refusing to remove the workspace root", filePath));
-      }
-      fs.rmSync(host.absolute, { recursive: options?.recursive === true, force: options?.force === true });
-      return ok(undefined);
-    } catch (error) {
-      return err(asFileError(error, filePath));
+  async remove(filePath: string, options: { recursive?: boolean; force?: boolean } | undefined, context: Context): Promise<Result<void, FileError>> {
+    const confined = this.tryConfine(filePath);
+    if (!confined.ok) {
+      return confined;
     }
+    if (confined.value === CONTAINER_WORKSPACE) {
+      return err(new FileError("invalid", "refusing to remove the workspace root", filePath));
+    }
+    const mode = options?.recursive === true
+      ? (options.force === true ? "recursive-force" : "recursive")
+      : (options?.force === true ? "force" : "plain");
+    const removed = await this.runOp("rm", confined.value, undefined, mode, context);
+    return removed.ok ? ok(undefined) : removed;
   }
 
-  async createTempDir(prefix: string | undefined, _context: Context): Promise<Result<string, FileError>> {
-    try {
-      const base = path.join(this.session.workspaceLeaf, ".tmp");
-      fs.mkdirSync(base, { recursive: true });
-      const created = fs.mkdtempSync(path.join(base, prefix ?? "tmp-"));
-      const relative = path.relative(this.session.workspaceLeaf, created);
-      return ok(path.posix.join("/workspace", relative.split(path.sep).join("/")));
-    } catch (error) {
-      return err(asFileError(error, prefix ?? ".tmp"));
+  async createTempDir(prefix: string | undefined, context: Context): Promise<Result<string, FileError>> {
+    const safe = safeTempComponent(prefix ?? "tmp-");
+    if (safe === undefined) {
+      return err(new FileError("invalid", "invalid", prefix ?? ".tmp"));
     }
+    const created = await this.runOp("mktemp-dir", CONTAINER_WORKSPACE, undefined, safe, context);
+    if (!created.ok) {
+      return created;
+    }
+    return this.tempPath(created.value);
   }
 
-  async createTempFile(options: { prefix?: string; suffix?: string } | undefined, _context: Context): Promise<Result<string, FileError>> {
-    try {
-      const base = path.join(this.session.workspaceLeaf, ".tmp");
-      fs.mkdirSync(base, { recursive: true });
-      const fd = fs.openSync(path.join(base, `${options?.prefix ?? "tmp-"}${Date.now()}${options?.suffix ?? ""}`), "wx", 0o644);
-      const filename = path.basename(fs.readlinkSync(`/proc/self/fd/${fd}`));
-      fs.closeSync(fd);
-      return ok(`/workspace/.tmp/${filename}`);
-    } catch (error) {
-      return err(asFileError(error, "temp"));
+  async createTempFile(options: { prefix?: string; suffix?: string } | undefined, context: Context): Promise<Result<string, FileError>> {
+    const prefix = safeTempComponent(options?.prefix ?? "tmp-");
+    const suffix = safeTempComponent(options?.suffix ?? "");
+    if (prefix === undefined || suffix === undefined) {
+      return err(new FileError("invalid", "invalid", "temp"));
     }
+    const created = await this.runOp("mktemp-file", prefix, undefined, suffix, context, true);
+    if (!created.ok) {
+      return created;
+    }
+    return this.tempPath(created.value);
   }
 
   async exec(command: string | readonly string[], options: ShellExecOptions | undefined, context: Context): Promise<Result<ShellExecResult, ExecutionError>> {
@@ -346,7 +392,7 @@ export class SandboxExecutionEnv implements ExecutionEnv {
       lease = await this.pool.acquire(this.session, context.abortSignal);
       const result = await withAbort(
         this.client.exec(this.session.runtime, lease.containerId, command, {
-          cwd: "/workspace",
+          cwd: CONTAINER_WORKSPACE,
           env: containerEnv(options?.env),
         }),
         context.abortSignal,
@@ -371,87 +417,108 @@ export class SandboxExecutionEnv implements ExecutionEnv {
     // The pool is shared by every bot. Idle timeout and controller shutdown stop containers.
   }
 
-  private mutate(filePath: string, write: (host: string) => void): Result<void, FileError> {
+  private tryConfine(input: string): Result<string, FileError> {
     try {
-      const host = this.hostFile(filePath);
-      this.assertParentsReal(path.posix.dirname(host.relative));
-      if (fs.existsSync(host.absolute) && fs.lstatSync(host.absolute).isSymbolicLink()) {
-        return err(new FileError("invalid", "symlink", filePath));
-      }
-      write(host.absolute);
-      return ok(undefined);
+      return ok(confineWorkspacePath(this.cwd, input));
     } catch (error) {
-      return err(asFileError(error, filePath));
+      return err(asFileError(error, input));
     }
   }
 
-  private containerPath(input: string): string {
-    return this.hostFile(input).container;
-  }
-
-  private hostFile(input: string): { container: string; relative: string; absolute: string } {
-    const container = normalizeContainer(this.cwd, input);
-    const relative = container === "/workspace" ? "" : container.slice("/workspace/".length);
-    return {
-      container,
-      relative,
-      absolute: relative.length === 0 ? this.session.workspaceLeaf : path.join(this.session.workspaceLeaf, relative),
-    };
-  }
-
-  private hostDir(input: string): { container: string; relative: string; absolute: string } {
-    const host = this.hostFile(input);
-    if (host.relative.length > 0) {
-      const stat = fs.lstatSync(host.absolute);
-      if (stat.isSymbolicLink()) {
-        throw new FileError("invalid", "symlink", input);
-      }
-      if (!stat.isDirectory()) {
-        throw new FileError("not_directory", "not_directory", input);
-      }
+  private tempPath(stdout: Uint8Array): Result<string, FileError> {
+    const relative = Buffer.from(stdout).toString("utf8").trim();
+    if (relative.length === 0 || relative.startsWith("/") || relative.split("/").includes("..")) {
+      return err(new FileError("invalid", "escape", ".tmp"));
     }
-    return host;
+    return ok(`${CONTAINER_WORKSPACE}/${relative}`);
   }
 
-  private assertParentsReal(relativeDir: string): void {
-    if (relativeDir === "." || relativeDir.length === 0 || relativeDir === "/") {
-      return;
+  private async runOp(
+    op: string,
+    requestPath: string,
+    stdin: Uint8Array | undefined,
+    extra: string | undefined,
+    context: Context,
+    literalPath = false,
+  ): Promise<Result<Uint8Array, FileError>> {
+    let containerPath = requestPath;
+    if (!literalPath) {
+      const confined = this.tryConfine(requestPath);
+      if (!confined.ok) {
+        return confined;
+      }
+      containerPath = confined.value;
     }
-    const parts = relativeDir.split("/").filter((part) => part.length > 0 && part !== ".");
-    let current = this.session.workspaceLeaf;
-    for (const part of parts) {
-      current = path.join(current, part);
-      if (!fs.existsSync(current)) {
-        return;
+    if (context.abortSignal?.aborted) {
+      return err(new FileError("aborted", "aborted", requestPath));
+    }
+    let lease: { release(): void; containerId: string } | undefined;
+    try {
+      lease = await this.pool.acquire(this.session, context.abortSignal);
+      const result = await withAbort(
+        this.client.exec(this.session.runtime, lease.containerId, fileOpArgv(op, containerPath, extra), {
+          cwd: CONTAINER_WORKSPACE,
+          env: containerEnv(undefined),
+          stdin,
+        }),
+        context.abortSignal,
+      );
+      return decodeOpResult(result, requestPath);
+    } catch (error) {
+      if (context.abortSignal?.aborted) {
+        return err(new FileError("aborted", "aborted", requestPath));
       }
-      if (fs.lstatSync(current).isSymbolicLink()) {
-        throw new FileError("invalid", "symlink", relativeDir);
+      if (error instanceof FileError) {
+        return err(error);
       }
+      if (error instanceof PodmanOutputTooLargeError) {
+        return err(new FileError("invalid", "too_large", requestPath));
+      }
+      return err(new FileError("unknown", "unknown", requestPath));
+    } finally {
+      lease?.release();
     }
   }
 }
 
-function normalizeContainer(cwd: string, input: string): string {
-  const joined = input.startsWith("/") ? input : path.posix.join(cwd, input);
-  const normalized = path.posix.normalize(joined);
-  if (normalized !== "/workspace" && !normalized.startsWith("/workspace/")) {
-    throw new FileError("invalid", "escape", input);
-  }
-  if (normalized.split("/").includes("..")) {
-    throw new FileError("invalid", "dotdot", input);
-  }
-  return normalized;
+function toBytes(content: string | Uint8Array): Uint8Array {
+  return typeof content === "string" ? Buffer.from(content) : content;
 }
 
-function toInfo(containerPath: string, stat: fs.Stats): FileInfo {
-  const kind = stat.isSymbolicLink() ? "symlink" : stat.isDirectory() ? "directory" : "file";
-  return {
-    name: path.posix.basename(containerPath),
-    path: containerPath,
-    kind,
-    size: stat.size,
-    mtimeMs: stat.mtimeMs,
-  };
+function decodeOpResult(result: PodmanExecResult, requestPath: string): Result<Uint8Array, FileError> {
+  const stdout = result.stdoutBytes === undefined ? Buffer.from(result.stdout) : Buffer.from(result.stdoutBytes);
+  if (result.exitCode !== 0) {
+    return err(fileErrorFromStderr(result.stderr, requestPath));
+  }
+  return ok(stdout);
+}
+
+function fileErrorFromStderr(stderr: string, requestPath: string): FileError {
+  const token = stderr.trim().split("\n")[0] ?? "";
+  if (!OP_CODES.has(token)) {
+    return new FileError("unknown", "unknown", requestPath);
+  }
+  if (token === "not_found" || token === "root") {
+    return new FileError("not_found", token, requestPath);
+  }
+  if (token === "not_directory") {
+    return new FileError("not_directory", token, requestPath);
+  }
+  if (token === "not_file") {
+    return new FileError("is_directory", token, requestPath);
+  }
+  return new FileError("invalid", token, requestPath);
+}
+
+function isKind(value: string | undefined): value is FileKind {
+  return value === "file" || value === "directory" || value === "symlink";
+}
+
+function safeTempComponent(value: string): string | undefined {
+  if (!/^[A-Za-z0-9._-]{0,40}$/.test(value)) {
+    return undefined;
+  }
+  return value;
 }
 
 function withAbort<T>(work: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
@@ -496,24 +563,6 @@ function abortError(): Error {
 function asFileError(error: unknown, requestPath: string): FileError {
   if (error instanceof FileError) {
     return error;
-  }
-  if (error instanceof PathEscapeError) {
-    if (error.code === "not_found" || error.code === "root") {
-      return new FileError("not_found", error.code, requestPath);
-    }
-    if (error.code === "not_dir") {
-      return new FileError("not_directory", error.code, requestPath);
-    }
-    if (error.code === "not_file") {
-      return new FileError("is_directory", error.code, requestPath);
-    }
-    return new FileError("invalid", error.code, requestPath);
-  }
-  if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") {
-    return new FileError("not_found", "not_found", requestPath);
-  }
-  if (typeof error === "object" && error !== null && "code" in error && error.code === "ELOOP") {
-    return new FileError("invalid", "symlink", requestPath);
   }
   return new FileError("unknown", "unknown", requestPath);
 }

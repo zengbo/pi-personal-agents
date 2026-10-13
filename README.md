@@ -4,7 +4,7 @@
 
 ## 一句话
 
-一个常驻的 **controller** 进程托管多个 bot（每个 bot 一个 pi-durable Harness + 一个 SQLite），工具执行全部转发进 **rootless Podman 沙箱**（默认 crun，不可信代码用 gVisor），危险操作由模型之外的 **策略引擎 + 人工审批** 把关，用户通过 **cloudflared tunnel + Cloudflare Access** 保护的 Web 聊天界面使用。
+一个常驻的 **controller** 进程托管多个 bot（每个 bot 一个 pi-durable Harness + 一个 SQLite），工具执行全部转发进 **rootless Podman 沙箱**（当前只启用 crun；runsc 在有 set-property 路径之前不可选），危险操作由模型之外的 **策略引擎 + 人工审批** 把关，用户通过 **cloudflared tunnel + Cloudflare Access** 保护的 Web 聊天界面使用。
 
 ## 首批 bot
 
@@ -12,7 +12,7 @@
 |---|---|---|
 | `chief`（主 bot，Chief of Staff） | 接收用户请求、规划、分派给子 bot、汇总、管理记忆 | 读写自己的工作区、给子 bot 发消息、无出网写操作 |
 | `researcher`（子 bot） | 网页检索、资料核实、写报告 | 只读网络（tinyproxy 白名单）、crun 沙箱 |
-| `ops`（子 bot，Coder/Ops） | 写代码、跑测试、运维脚本 | crun 沙箱；运行不可信代码时用 gVisor 档；一切部署/推送需审批 |
+| `ops`（子 bot，Coder/Ops） | 写代码、跑测试、运维脚本 | crun 沙箱；一切部署/推送需审批。runsc 暂不可选 |
 
 ## 文档
 
@@ -25,7 +25,7 @@
 
 ## 状态
 
-Phase 0 已合并（`39774a1`）。Phase 1（controller、Web、三个 bot、Podman 沙箱、审批）已合并到 main（`f50f652`）。bot 对话使用 pi-durable 1.1.0 的内置上下文压缩；retry 仍关闭。部署步骤见 [docs/deployment.md](docs/deployment.md)。设计文档仍是规格；VPS 上的 48 项环境测试不在 CI 里重跑，也不从这里登录 `racknerd_us`。
+Phase 0 已合并（`39774a1`）。Phase 1（controller、Web、三个 bot、Podman 沙箱、审批）已合并到 main（`f50f652`）。上下文压缩已合并（`a4d56ca`）。生产沙箱只启动 crun；会话叶子由 sbx 的 helper 创建（`0700`）。retry 仍关闭，待确认。部署步骤见 [docs/deployment.md](docs/deployment.md)。设计文档仍是规格；VPS 上的 48 项环境测试不在 CI 里重跑，也不从这里登录 `racknerd_us`。
 
 ## 依赖版本（精确锁定）
 

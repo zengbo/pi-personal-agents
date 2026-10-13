@@ -3,6 +3,7 @@ import type { Context } from "@earendil-works/chord";
 import { defineExtension, defineTool, section, type Extension, type ToolRegistration } from "@earendil-works/pi-durable";
 import { policyExtensionHook } from "../policy/hook.ts";
 import type { PolicyEngine } from "../policy/engine.ts";
+import { refuseDisabledRuntime } from "../sandbox/runtime-guard.ts";
 
 export const BOTS = ["chief", "researcher", "ops"] as const;
 export type BotName = (typeof BOTS)[number];
@@ -23,7 +24,7 @@ const trust = section(
 );
 
 export interface RuntimeSwitch {
-  set(bot: BotName, session: string, runtime: "crun" | "runsc"): void;
+  set(bot: BotName, session: string, runtime: "crun"): void;
 }
 
 export function botExtension(
@@ -127,13 +128,17 @@ function dangerousTool(name: "git_push" | "deploy"): ToolRegistration {
 function setRuntimeTool(bot: BotName, runtimeSwitch: RuntimeSwitch | undefined): ToolRegistration {
   return defineTool({
     name: "set_runtime",
-    description: "Switch the session sandbox between crun and runsc. runsc to crun requires approval.",
+    description: "The session sandbox runtime is crun. runsc is disabled until a set-property path exists.",
     parameters: Type.Object({ runtime: Type.Union([Type.Literal("crun"), Type.Literal("runsc")]) }),
     replay: "unsafe",
     execute: async (args, api) => {
+      const refused = refuseDisabledRuntime(args.runtime);
+      if (refused !== undefined) {
+        return { content: [{ type: "text", text: refused }] };
+      }
       const session = String(api.conversationId).replace(/[^A-Za-z0-9._-]/g, "").slice(0, 80) || "session";
-      runtimeSwitch?.set(bot, session, args.runtime);
-      return { content: [{ type: "text", text: args.runtime }] };
+      runtimeSwitch?.set(bot, session, "crun");
+      return { content: [{ type: "text", text: "crun" }] };
     },
   });
 }
