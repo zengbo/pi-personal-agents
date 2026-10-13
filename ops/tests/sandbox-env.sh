@@ -121,7 +121,7 @@ with_sleep_ctr() {
   local url name id rc=0
   url="$(socket_for "$runtime")"
   name="ppa-${runtime}-${BASHPID}-${RANDOM}"
-  id="$(sbx podman --url "$url" create --name "$name" "${HARD_FLAGS[@]}" localhost/sandbox-base:1 sleep 180)"
+  id="$(sbx podman --url "$url" create --name "$name" "${HARD_FLAGS[@]}" localhost/sandbox-base:1 sleep 180)" || return 1
   if [[ "$runtime" == "runsc" ]]; then
     # The conmon scope may not exist until start. Ignore a miss here.
     apply_runsc_limits "$id" || true
@@ -148,8 +148,8 @@ check_uid() {
 }
 _uid_is_1000() {
   local uid
-  uid="$(exec_out "$1" "$2" id -u)"
-  [[ "$uid" == "1000" ]]
+  uid="$(exec_out "$1" "$2" id -u)" || return 1
+  [[ "$uid" == "1000" ]] || return 1
 }
 
 check_gid() {
@@ -157,8 +157,8 @@ check_gid() {
 }
 _gid_is_1000() {
   local gid
-  gid="$(exec_out "$1" "$2" id -g)"
-  [[ "$gid" == "1000" ]]
+  gid="$(exec_out "$1" "$2" id -g)" || return 1
+  [[ "$gid" == "1000" ]] || return 1
 }
 
 check_caps() {
@@ -166,8 +166,8 @@ check_caps() {
 }
 _caps_empty() {
   local line
-  line="$(exec_out "$1" "$2" grep '^CapEff:' /proc/self/status)"
-  [[ "$line" == *"0000000000000000" ]]
+  line="$(exec_out "$1" "$2" grep '^CapEff:' /proc/self/status)" || return 1
+  [[ "$line" == *"0000000000000000" ]] || return 1
 }
 
 check_nnp() {
@@ -175,8 +175,8 @@ check_nnp() {
 }
 _nnp_set() {
   local line
-  line="$(exec_out "$1" "$2" grep '^NoNewPrivs:' /proc/self/status)"
-  [[ "$line" == *":	1" || "$line" == *": 1" ]]
+  line="$(exec_out "$1" "$2" grep '^NoNewPrivs:' /proc/self/status)" || return 1
+  [[ "$line" == *":	1" || "$line" == *": 1" ]] || return 1
 }
 
 check_root_ro() {
@@ -193,14 +193,14 @@ check_tmp_rw() {
   with_sleep_ctr "$1" _tmp_rw
 }
 _tmp_rw() {
-  exec_out "$1" "$2" sh -c 'touch /tmp/probe && rm /tmp/probe'
+  exec_out "$1" "$2" sh -c 'touch /tmp/probe && rm /tmp/probe' || return 1
 }
 
 check_home_rw() {
   with_sleep_ctr "$1" _home_rw
 }
 _home_rw() {
-  exec_out "$1" "$2" sh -c 'touch /home/sbx/probe && rm /home/sbx/probe'
+  exec_out "$1" "$2" sh -c 'touch /home/sbx/probe && rm /home/sbx/probe' || return 1
 }
 
 check_memory() {
@@ -254,13 +254,13 @@ check_cpu() {
 }
 _cpu_crun() {
   local nanos
-  nanos="$(sbx podman --url "$1" inspect --format '{{.HostConfig.NanoCpus}}' "$2")"
-  [[ "$nanos" == "1000000000" ]]
+  nanos="$(sbx podman --url "$1" inspect --format '{{.HostConfig.NanoCpus}}' "$2")" || return 1
+  [[ "$nanos" == "1000000000" ]] || return 1
 }
 _cpu_runsc() {
   local quota
-  quota="$(sbx systemctl --user show "libpod-conmon-$2.scope" -p CPUQuotaPerSecUSec --value)"
-  [[ "$quota" == "1s" || "$quota" == "100%" ]]
+  quota="$(sbx systemctl --user show "libpod-conmon-$2.scope" -p CPUQuotaPerSecUSec --value)" || return 1
+  [[ "$quota" == "1s" || "$quota" == "100%" ]] || return 1
 }
 
 check_direct_egress() {
@@ -290,8 +290,8 @@ check_proxy_deny() {
 }
 _proxy_status() {
   local url="$1" id="$2" host="$3" want="$4" line
-  line="$(exec_out "$url" "$id" bash -c "exec 3<>/dev/tcp/10.0.2.2/8888 || exit 2; printf 'CONNECT ${host}:443 HTTP/1.1\r\nHost: ${host}:443\r\nProxy-Connection: close\r\n\r\n' >&3; IFS= read -r status <&3; printf '%s\n' \"\$status\"; exec 3>&-")"
-  [[ "$line" == *" ${want}"* ]]
+  line="$(exec_out "$url" "$id" bash -c "exec 3<>/dev/tcp/10.0.2.2/8888 || exit 2; printf 'CONNECT ${host}:443 HTTP/1.1\r\nHost: ${host}:443\r\nProxy-Connection: close\r\n\r\n' >&3; IFS= read -r status <&3; printf '%s\n' \"\$status\"; exec 3>&-")" || return 1
+  [[ "$line" == *" ${want}"* ]] || return 1
 }
 
 check_no_socket() {
@@ -357,10 +357,12 @@ test_T6a_runsc() { check_no_socket runsc; }
 test_T6b_runsc() { check_no_agentctl runsc; }
 
 require_dir_mode() {
-  local path="$1" mode="$2" owner="$3"
-  [[ ! -L "$path" ]]
-  [[ "$(stat -c %a "$path")" == "$mode" ]]
-  [[ "$(stat -c %U "$path")" == "$owner" ]]
+  local path="$1" mode="$2" owner="$3" actual_mode actual_owner
+  [[ ! -L "$path" ]] || return 1
+  actual_mode="$(stat -c %a "$path")" || return 1
+  [[ "$actual_mode" == "$mode" ]] || return 1
+  actual_owner="$(stat -c %U "$path")" || return 1
+  [[ "$actual_owner" == "$owner" ]] || return 1
 }
 
 test_H1() {
@@ -397,68 +399,85 @@ test_H11() {
   slice_has TasksMax 2048 2048
 }
 test_H12() {
-  local quota
+  local quota limits
+  limits="${SBX_SLICE_LIMITS:-/etc/systemd/system/user-1001.slice.d/limits.conf}"
   quota="$(systemctl show user-1001.slice -p CPUQuotaPerSecUSec --value 2>/dev/null || true)"
   if [[ "$quota" == "2.5s" || "$quota" == "250%" ]]; then
     return 0
   fi
-  grep -E -q '^CPUQuota=250%' /etc/systemd/system/user-1001.slice.d/limits.conf
+  grep -E -q '^CPUQuota=250%' "$limits" || return 1
 }
 slice_has() {
-  local prop="$1" pretty="$2" bytes="$3" value
+  local prop="$1" pretty="$2" bytes="$3" value limits
+  limits="${SBX_SLICE_LIMITS:-/etc/systemd/system/user-1001.slice.d/limits.conf}"
   value="$(systemctl show user-1001.slice -p "$prop" --value 2>/dev/null || true)"
   if [[ "$value" == "$pretty" || "$value" == "$bytes" || "$value" == "${pretty%M}" ]]; then
     return 0
   fi
-  grep -E -q "^${prop}=${pretty}$" /etc/systemd/system/user-1001.slice.d/limits.conf
+  grep -E -q "^${prop}=${pretty}$" "$limits" || return 1
 }
 test_H13() {
   local rules
-  rules="$(nft list table inet sbx_egress)"
-  [[ "$rules" == *"8888"* ]]
-  [[ "$rules" == *"drop"* || "$rules" == *"reject"* ]]
+  if [[ -n "${SBX_NFT_SNAPSHOT:-}" ]]; then
+    rules="$(cat "$SBX_NFT_SNAPSHOT")" || return 1
+  else
+    rules="$(nft list table inet sbx_egress)" || return 1
+  fi
+  [[ "$rules" == *"8888"* ]] || return 1
+  [[ "$rules" == *"drop"* || "$rules" == *"reject"* ]] || return 1
 }
 test_H14() {
-  local conf=""
-  for candidate in /etc/tinyproxy/tinyproxy.conf /etc/tinyproxy.conf; do
+  local conf="" candidate
+  local -a candidates=()
+  if [[ -n "${SBX_TINYPROXY_CONF:-}" ]]; then
+    candidates=("$SBX_TINYPROXY_CONF")
+  else
+    candidates=(/etc/tinyproxy/tinyproxy.conf /etc/tinyproxy.conf)
+  fi
+  for candidate in "${candidates[@]}"; do
     if [[ -f "$candidate" ]]; then
       conf="$candidate"
       break
     fi
   done
-  [[ -n "$conf" ]]
-  grep -E -q '^[[:space:]]*FilterDefaultDeny[[:space:]]+Yes[[:space:]]*$' "$conf"
-  ss -ltn | grep -F -q '127.0.0.1:8888'
+  [[ -n "$conf" ]] || return 1
+  grep -E -q '^[[:space:]]*FilterDefaultDeny[[:space:]]+Yes[[:space:]]*$' "$conf" || return 1
+  if [[ -n "${SBX_LISTEN_SNAPSHOT:-}" ]]; then
+    grep -F -q '127.0.0.1:8888' "$SBX_LISTEN_SNAPSHOT" || return 1
+  else
+    ss -ltn | grep -F -q '127.0.0.1:8888' || return 1
+  fi
 }
 test_H15() {
-  [[ -d /home/sbx/workspaces ]]
-  [[ ! -L /home/sbx/workspaces ]]
+  local root="${SBX_WORKSPACE_ROOT:-/home/sbx/workspaces}"
+  [[ -d "$root" ]] || return 1
+  [[ ! -L "$root" ]] || return 1
   local mode
-  mode="$(stat -c %a /home/sbx/workspaces)"
+  mode="$(stat -c %a "$root")" || return 1
   # 027 = group-write plus any other-access. 0750 clears those bits; 0755 does not.
-  [[ $((8#$mode & 8#027)) -eq 0 ]]
+  [[ $((8#$mode & 8#027)) -eq 0 ]] || return 1
   local bot session smode
-  for bot in /home/sbx/workspaces/*; do
+  for bot in "$root"/*; do
     [[ -d "$bot" ]] || continue
-    [[ ! -L "$bot" ]]
-    mode="$(stat -c %a "$bot")"
-    [[ $((8#$mode & 8#027)) -eq 0 ]]
+    [[ ! -L "$bot" ]] || return 1
+    mode="$(stat -c %a "$bot")" || return 1
+    [[ $((8#$mode & 8#027)) -eq 0 ]] || return 1
     for session in "$bot"/*; do
       [[ -e "$session" ]] || continue
-      [[ ! -L "$session" ]]
-      smode="$(stat -c %a "$session")"
-      # A session leaf may be 0777. Anything above that is impossible in the low 9 bits.
-      [[ "$smode" == "777" || $((8#$smode & 022)) -eq 0 ]]
+      [[ ! -L "$session" ]] || return 1
+      smode="$(stat -c %a "$session")" || return 1
+      # A session leaf may be 0777. 022 = group-write or other-write.
+      [[ "$smode" == "777" || $((8#$smode & 8#022)) -eq 0 ]] || return 1
     done
   done
 }
 test_H16() {
-  node --experimental-strip-types "$ROOT/path-escape-check.ts" self-test >/dev/null
+  node --experimental-strip-types "$ROOT/path-escape-check.ts" self-test >/dev/null || return 1
   if [[ -d /home/agentctl && ! -L /home/agentctl ]]; then
     local tmp out rc=0
-    tmp="$(mktemp -d)"
-    ln -s /home/agentctl "$tmp/agentctl"
-    out="$(mktemp)"
+    tmp="$(mktemp -d)" || return 1
+    out="$(mktemp)" || { rm -rf "$tmp"; return 1; }
+    ln -s /home/agentctl "$tmp/agentctl" || { rm -rf "$tmp" "$out"; return 1; }
     set +e
     node --experimental-strip-types "$ROOT/path-escape-check.ts" read "$tmp" agentctl >"$out" 2>/dev/null
     rc=$?
@@ -468,7 +487,7 @@ test_H16() {
       echo "symlink to /home/agentctl was readable" >&2
       return 1
     fi
-    rm -rf "$tmp" "$out"
+    rm -rf "$tmp" "$out" || return 1
   fi
 }
 test_T8() {
@@ -483,11 +502,11 @@ test_T8() {
   }
   trap cleanup_t8 RETURN
   for i in 1 2 3; do
-    id="$(sbx podman --url "$url" create --name "ppa-t8-${BASHPID}-${i}" "${HARD_FLAGS[@]}" localhost/sandbox-base:1 sleep 90)"
+    id="$(sbx podman --url "$url" create --name "ppa-t8-${BASHPID}-${i}" "${HARD_FLAGS[@]}" localhost/sandbox-base:1 sleep 90)" || return 1
     ids+=("$id")
-    sbx podman --url "$url" start "$id" >/dev/null
+    sbx podman --url "$url" start "$id" >/dev/null || return 1
   done
-  sleep 2
+  sleep 2 || return 1
   if ! awk '
     $1 == "MemTotal:" { total = $2 }
     $1 == "MemAvailable:" { avail = $2 }
@@ -511,9 +530,9 @@ test_T9() {
   local runtime url count=0 n
   for runtime in crun runsc; do
     url="$(socket_for "$runtime")"
-    n="$(sbx podman --url "$url" ps -q | wc -l)"
+    n="$(sbx podman --url "$url" ps -q | wc -l)" || return 1
     n="${n// /}"
-    count=$((count + n))
+    count=$((count + n)) || return 1
   done
   if [[ "$count" -gt "$MAX_SANDBOXES" ]]; then
     echo "running sandboxes=$count exceeds $MAX_SANDBOXES" >&2
@@ -521,6 +540,13 @@ test_T9() {
   fi
 }
 
+# Sourced by unit tests so they can call one check. Executing the file runs the suite.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+  return 0
+fi
+
+# `if "$fn"` disables set -e for the whole call, including helpers. Checks use
+# `|| return 1` so an early failure is not replaced by a later success.
 pass=0
 fail=0
 while IFS=$'\t' read -r id _desc; do
