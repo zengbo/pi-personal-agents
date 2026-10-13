@@ -209,7 +209,7 @@ function webApp(options: ControllerOptions, harnesses: ReadonlyMap<BotName, Harn
         onView(project(value));
       });
       return () => {
-        void watch.stop();
+        void watch.stop().catch(() => undefined);
       };
     },
     approvals: () => options.engine.listPending(),

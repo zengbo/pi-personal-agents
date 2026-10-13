@@ -199,7 +199,9 @@ export class SandboxPool {
         slot.cancelIdle = this.schedule(this.idleMs, () => {
           slot.cancelIdle = undefined;
           if (slot.refs === 0) {
-            void this.stopSlot(slot);
+            void this.stopSlot(slot).catch(() => {
+              logStopFailure(slot.containerId);
+            });
           }
         });
       },
@@ -246,4 +248,10 @@ function abortError(): Error {
   const error = new Error("sandbox queue aborted");
   error.name = "AbortError";
   return error;
+}
+
+/** Fixed text plus a container id. The driver error is not logged. */
+function logStopFailure(containerId: string): void {
+  const id = /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/.test(containerId) ? containerId : "unknown";
+  process.stderr.write(`sandbox stop failed: ${id}\n`);
 }

@@ -57,6 +57,71 @@ describe("sandbox pool", () => {
     await pool.shutdown();
   });
 
+  it("releases the slot when stop throws and starts the queued sandbox", async () => {
+    const started: string[] = [];
+    const driver: SandboxDriver = {
+      start: (session) => {
+        started.push(session.session);
+        return Promise.resolve({ containerId: `ctr-${session.session}` });
+      },
+      stop: () => Promise.reject(new Error("podman stop failed token=super-secret-token")),
+    };
+    let now = 0;
+    const timers: { at: number; fn: () => void }[] = [];
+    const pool = new SandboxPool(driver, {
+      idleMs: 1000,
+      schedule: (ms, fn) => {
+        const item = { at: now + ms, fn };
+        timers.push(item);
+        return () => {
+          const index = timers.indexOf(item);
+          if (index >= 0) {
+            timers.splice(index, 1);
+          }
+        };
+      },
+    });
+    const rejections: unknown[] = [];
+    const onRejection = (reason: unknown): void => {
+      rejections.push(reason);
+    };
+    process.on("unhandledRejection", onRejection);
+    const stderr: string[] = [];
+    const originalWrite = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: string | Uint8Array) => {
+      stderr.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      const leases = await Promise.all([1, 2, 3].map((n) => pool.acquire(session(String(n)))));
+      const fourth = pool.acquire(session("4"));
+      await Promise.resolve();
+      expect(pool.queuedCount()).toBe(1);
+      leases[0]?.release();
+      now = 1000;
+      for (const timer of [...timers]) {
+        if (timer.at <= now) {
+          timer.fn();
+        }
+      }
+      const lease = await fourth;
+      await flush();
+      expect(rejections).toEqual([]);
+      expect(started).toEqual(["1", "2", "3", "4"]);
+      expect(pool.runningCount()).toBe(MAX_RUNNING_SANDBOXES);
+      expect(pool.queuedCount()).toBe(0);
+      expect(lease.containerId).toBe("ctr-4");
+      const logged = stderr.join("");
+      expect(logged).toContain("sandbox stop failed: ctr-1");
+      expect(logged).not.toContain("super-secret-token");
+      lease.release();
+    } finally {
+      process.stderr.write = originalWrite;
+      process.off("unhandledRejection", onRejection);
+      await pool.shutdown().catch(() => undefined);
+    }
+  });
+
   it("cancels a queued sandbox", async () => {
     const driver: SandboxDriver = {
       start: (session) => Promise.resolve({ containerId: session.session }),
@@ -158,6 +223,12 @@ describe("workspace directories", () => {
     }
   });
 });
+
+function flush(): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, 0);
+  });
+}
 
 function session(name: string, runtime: "crun" | "runsc" = "crun"): SandboxSession {
   return { bot: "ops", session: name, runtime, workspaceLeaf: `/tmp/ppa-leaf-${name}` };
