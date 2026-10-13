@@ -1,0 +1,15 @@
+# cloudflared ingress template. No tunnel credentials, tokens, or account keys.
+# Copy on the VPS (as the cloudflared system user) and substitute the placeholders
+# from the operator's local environment. Do not commit the filled-in file.
+#
+# The origin is loopback only. Cloudflare Access sits in front of the tunnel.
+# Phase 1's web server binds 127.0.0.1. The port below is a placeholder; the
+# design does not assign one.
+
+tunnel: ${CLOUDFLARED_TUNNEL_ID}
+credentials-file: /etc/cloudflared/${CLOUDFLARED_TUNNEL_ID}.json
+
+ingress:
+  - hostname: ${CLOUDFLARED_HOSTNAME}
+    service: http://127.0.0.1:8787
+  - service: http_status:404

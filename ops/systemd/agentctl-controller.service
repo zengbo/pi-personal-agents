@@ -1,0 +1,30 @@
+# Template for the controller system unit. Not installed by CI.
+# Do not copy this onto racknerd_us from an agent session.
+# Phase 1 replaces ExecStart with the real controller entrypoint.
+# Secrets stay in /home/agentctl/secrets (mode 0700) and are never stored in this file.
+
+[Unit]
+Description=pi-personal-agents controller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=agentctl
+Group=agentctl
+WorkingDirectory=/home/agentctl/app
+EnvironmentFile=-/home/agentctl/secrets/controller.env
+ExecStart=/usr/bin/node /home/agentctl/app/dist/controller.js
+Restart=on-failure
+RestartSec=2
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=no
+ReadWritePaths=/home/agentctl/data /home/agentctl/secrets
+ReadOnlyPaths=/home/agentctl/app
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
