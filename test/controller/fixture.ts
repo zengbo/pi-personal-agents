@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxProvider } from "@earendil-works/pi-ai/providers/faux";
-import type { CompactionPolicy, Harness } from "@earendil-works/pi-durable";
+import type { CompactionPolicy, ConversationRetryPolicy, Harness } from "@earendil-works/pi-durable";
 import { FileCredentialStore } from "../../src/auth/file-credential-store.ts";
 import { LoginSession, type LoginDriver } from "../../src/auth/login.ts";
 import { BOTS, type BotName } from "../../src/bots/extensions.ts";
@@ -27,6 +27,7 @@ export interface TestRigOptions {
   readonly exec?: PodmanClient["exec"];
   readonly prepare?: (faux: Map<BotName, ReturnType<typeof fauxProvider>>) => void;
   readonly compaction?: Partial<CompactionPolicy>;
+  readonly retry?: Partial<ConversationRetryPolicy>;
   readonly onHarness?: (bot: BotName, harness: Harness) => void;
 }
 
@@ -143,6 +144,7 @@ export async function startTestRig(options?: TestRigOptions): Promise<TestRig> {
     login,
     trace: options?.trace,
     compaction: options?.compaction,
+    retry: options?.retry,
     onHarness: options?.onHarness,
   });
   } catch (error) {
