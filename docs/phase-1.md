@@ -12,7 +12,7 @@ Phase 0 的规格仍以 `docs/design.md` 与 `docs/implementation-plan.md` 为�
 
 不生成 `dist/`。启动顺序是拿 flock → `Harness.open` → 安装扩展 → `resume` → 只在 `127.0.0.1` 上听 HTTP。每个 bot 一个 SQLite（`<data>/<bot>.sqlite`）和一把 flock。持锁进程单独成组，并在 controller 的 pid 消失后退出，所以 `SIGKILL` 不会把锁留住。
 
-每个 bot 打开 pi-durable 自带的 compaction（`DEFAULT_COMPACTION_POLICY`）。超过上下文窗口减去 `reserveTokens` 时，生成会先摘要再继续。retry 仍是关的（`enabled: false`，`maxRetries: 0`，`baseDelayMs: 0`），避免失败请求打成循环。压缩已经落地；retry 和只列出 root 会话这两项主人接受继续搁置，见 `docs/follow-ups.md`。
+每个 bot 打开 pi-durable 自带的 compaction（`DEFAULT_COMPACTION_POLICY`）。超过上下文窗口减去 `reserveTokens` 时，生成会先摘要再继续。retry 仍是关的（`enabled: false`，`maxRetries: 0`，`baseDelayMs: 0`）。压缩已经落地。只列出 root 会话这一项主人接受继续搁置；retry 仍关闭，待确认。见 `docs/follow-ups.md`。
 
 会话列表只返回 root。`Harness` 没有 `scanConversations`（那是 Storage 上的方法），fork 出来的会话还没接到 Web。
 

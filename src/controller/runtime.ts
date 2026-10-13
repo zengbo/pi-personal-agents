@@ -42,6 +42,8 @@ export interface ControllerOptions {
   readonly trace?: string[];
   /** Merged over pi-durable's built-in compaction policy. Tests lower the thresholds. */
   readonly compaction?: Partial<CompactionPolicy>;
+  /** Test hook. Fired once each harness is open, before extensions are installed. */
+  readonly onHarness?: (bot: BotName, harness: Harness) => void;
 }
 
 /** Built-in pi-durable compaction, with an optional test override. Retry stays off. */
@@ -96,6 +98,7 @@ export async function startController(options: ControllerOptions): Promise<Runni
         context,
       );
       harnesses.set(bot, harness);
+      options.onHarness?.(bot, harness);
     }
     trace?.push("install");
     const router: DelegateRouter = {

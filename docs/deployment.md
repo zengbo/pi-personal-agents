@@ -35,7 +35,7 @@
 
 - `/home/agentctl/data`：`0700`，属主 `agentctl`。每个 bot 一个 SQLite（`chief.sqlite`、`researcher.sqlite`、`ops.sqlite`），加上 `policy.sqlite` 和 `audit.jsonl`。
 - `/home/agentctl/secrets`：`0700`，属主 `agentctl`。`controller.env` 用 `0600`。ChatGPT OAuth 材料也在这里，一个 provider 一个 JSON，写入时是 `0600`。
-- `/home/sbx/workspaces/<bot>/<session>`：父目录最多 `0750`（可以加只给 agentctl 的 ACL）。只有会话叶子可以是 `0777`。父目录已经比 `0750` 松时，controller 会拒绝，不会把它 chmod 得更松。
+- `/home/sbx/workspaces/<bot>/<session>`：父目录属主 `sbx`，模式最多 `0750`。可以给 agentctl 加只含 `r`/`x` 的 ACL。只有会话叶子可以是 `0777`。父目录已经比 `0750` 松时，controller 会拒绝，不会把它 chmod 得更松。在当前 systemd 单元下，agentctl 创建不了这个叶子，见第 12 节。
 - `user-1001.slice` 的兜底写在 `/etc/systemd/system/user-1001.slice.d/limits.conf`：`MemoryMax=2600M`、`MemorySwapMax=512M`、`TasksMax=2048`、`CPUQuota=250%`。
 
 创建示例（在 VPS 上，由操作者执行）：
@@ -45,7 +45,21 @@ install -d -o agentctl -g agentctl -m 0700 /home/agentctl/data /home/agentctl/se
 install -d -o sbx -g sbx -m 0750 /home/sbx/workspaces
 ```
 
-会话叶子由 controller 在第一次用到时创建，保持 `0777`。不要把 `/home/agentctl`、Podman socket 或 secrets 挂进容器。
+`ensureWorkspace` 会尝试创建会话叶子并把它设成 `0777`。当前单元下这一步做不到，见第 12 节。不要把 `/home/agentctl`、Podman socket 或 secrets 挂进容器。
+
+### Podman socket 给 agentctl 的访问
+
+controller 以 `agentctl`（uid 1000）直接连这两个 unix socket（`UnixPodmanClient`）：
+
+- `/run/sbx/podman.sock`（crun）
+- `/run/sbx/podman-runsc.sock`（gVisor）
+
+socket 的属主保持 `sbx`。`agentctl` 的连接权只用下面两种之一：
+
+- 一个只包含 `agentctl` 的用户组，socket 模式 `0660`
+- 用户 ACL，例如 `u:agentctl:rw`，socket 模式 `0600`
+
+`/run/sbx` 目录本身保持 `sbx` 可进入，不要对其他用户可写。禁止把 socket 改成 `0666`、`0662`、`0777`，也禁止 `chmod a+rw` 或任何让 `agentctl` 和 `sbx` 以外的用户能连上的模式。组或 ACL 只加到 `agentctl` 这一个账号。
 
 ## 3. 检出代码与安装依赖
 
@@ -178,30 +192,29 @@ env | grep '^SBX_' || true
 
 期望没有上面那五个。48 项都通过才算这台机器的沙箱环境可用。CI 不会在 GitHub 上重跑这 48 项。
 
-## 9. 确认 runsc 的 set-property 时机
+## 9. runsc 的 set-property 时机
 
-runsc 档的限制不靠 `podman run --memory`。controller 的顺序在 `createPodmanDriver` 里：
+runsc 档的限制不靠 `podman --memory`。`createPodmanDriver` 的顺序是：
 
-1. `POST /v4.0.0/libpod/containers/create`。容器处于已创建、尚未 start。命令是 `sleep infinity`。
-2. 仅 runsc：以 `sbx` 的用户会话执行  
-   `systemctl --user set-property libpod-conmon-<id>.scope MemoryMax=768M TasksMax=256 CPUQuota=100%`。  
-   controller 不是 uid 1001 时，前面会加 `runuser -u sbx -- env XDG_RUNTIME_DIR=/run/user/1001`。
-3. 这一步退出码不是 0：stop 并删除该容器，然后抛错，**不会 start**。
-4. 退出码是 0：才 `start`。
+1. `POST /v4.0.0/libpod/containers/create`。容器已创建，尚未 start。命令是 `sleep infinity`。
+2. 仅 runsc：`systemctl --user set-property libpod-conmon-<id>.scope MemoryMax=768M TasksMax=256 CPUQuota=100%`。进程的 uid 不是 1001 时，代码会在前面加上 `runuser -u sbx -- env XDG_RUNTIME_DIR=/run/user/1001`。
+3. 这一步退出码不是 0：stop 并删除该容器，然后抛错，不 start。
+4. 退出码是 0：才 start。
 
-在 VPS 上用一次手工创建确认 scope 在 start 之前就存在（把 `<id>` 换成 create 打印的 id）：
+验收脚本在 start 之前对 set-property 使用了 `|| true`，那是测试夹具。controller 没有这条放行。
+
+以 `sbx` 的用户会话可以核对 scope 是否在 start 之前就存在（把 `<id>` 换成 create 打印的 id，参数与 `ops/tests/sandbox-env.sh` 的 `HARD_FLAGS` 相同，镜像 `localhost/sandbox-base:1`，命令 `sleep infinity`）：
 
 ```bash
-# 使用与 ops/tests/sandbox-env.sh 相同的 HARD_FLAGS，镜像 localhost/sandbox-base:1，命令 sleep infinity
-# podman create（不要 start）之后立刻：
-runuser -u sbx -- env XDG_RUNTIME_DIR=/run/user/1001 \
-  systemctl --user status "libpod-conmon-<id>.scope"
-runuser -u sbx -- env XDG_RUNTIME_DIR=/run/user/1001 \
-  systemctl --user set-property "libpod-conmon-<id>.scope" \
+# podman create（不要 start）之后立刻，在 sbx 的用户会话里：
+systemctl --user status "libpod-conmon-<id>.scope"
+systemctl --user set-property "libpod-conmon-<id>.scope" \
   MemoryMax=768M TasksMax=256 CPUQuota=100%
 ```
 
-`set-property` 成功之后才可以 start。若 scope 在 start 之前不存在，`set-property` 会失败：按 controller 的行为删掉这个容器，不要把它 start 起来。验收脚本里 start 之前的 `|| true` 是测试夹具，controller 没有这条放行。
+scope 在 start 之前不存在时，删掉这个容器，不要 start。这次核对只说明主机上的 scope 时机。它不能说明 `agentctl` 服务里的 `runuser -u sbx` 会成功。
+
+服务实际跑不起来：单元是 `User=agentctl`（uid 1000）并且 `NoNewPrivileges=yes`。`runuser` 要换成 uid 1001，在这个限制下失败。set-property 失败后容器被 stop，runsc 档不会 start。这是未解决项，部署前必须先定，见第 12 节。
 
 同时看第 4 节，确认镜像里有 `bash` 和 `sleep`。
 
@@ -237,9 +250,38 @@ journalctl -u agentctl-controller -e
 | `missing CLOUDFLARE_ACCESS_AUD`（或其它 `missing …`） | `controller.env` 少了必填变量，或文件权限让 `agentctl` 读不到 |
 | `access jwks request failed` / `access jwks had no rsa keys` | 第一次拉取失败，进程退出。检查 `CLOUDFLARE_ACCESS_JWKS_URL` 从这台机器是否可达 |
 | `jwks refresh failed: …` | 运行中的刷新失败。这一行只会出现固定短句（`access jwks request failed`、`access jwks had no rsa keys` 或 `request failed`），不会带上 token、cookie 或完整 URL。已有密钥还留着 |
-| `runsc limits were not applied; container was not started` | runsc 的 `set-property` 失败。容器已 stop，没有 start。回到第 9 节看 scope 是否在 start 前存在 |
+| `runsc limits were not applied; container was not started` | runsc 的 `set-property` 失败。容器已 stop，没有 start。在当前单元里，uid 1000 的 `runuser -u sbx` 会走这条失败，见第 12 节 |
 | `sandbox stop failed: <id>` | 空闲容器 stop 失败。`<id>` 只是容器 id。槽位仍会释放。这一行没有命令输出，也没有环境变量 |
 | `listening` 之后浏览器 401 | Access JWT 的 `aud`、`iss`、`email` 与环境变量不一致，或 `email` 不是 `PPA_OWNER_EMAIL` |
 | 浏览器 403 | POST 或 WebSocket 的 `Origin` 不是 `https://<CLOUDFLARED_HOSTNAME>` |
 
 cloudflared 自身的日志用它的系统单元看（常见是 `journalctl -u cloudflared`）。tunnel 通、本机 `curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8787/` 在没有 JWT 时是 `401`，说明 controller 在听，并且没有把页面暴露成匿名可读。
+
+## 12. 未解决，部署前必须先定
+
+下面两件事主人还没有选定做法。候选并列在这里，也写在 [docs/follow-ups.md](follow-ups.md)。候选都不改这三项：`NoNewPrivileges` 保持 `yes`，`ProtectSystem` 保持 `strict`，工作区父目录保持最多 `0750`、agentctl 只有 `r`/`x`。
+
+### runsc 容器起不来
+
+`createPodmanDriver` 在 uid 不是 1001 时用 `runuser -u sbx` 执行 `systemctl --user set-property`。服务用户是 `agentctl`（uid 1000），单元又有 `NoNewPrivileges=yes`，这次 `runuser` 失败。失败则 stop 并且不 start，所以 runsc 档没有容器能跑起来。crun 档不走 `runuser`，它只依赖第 2 节的 socket 权限。
+
+候选：
+
+- 单独一个 `User=sbx` 的辅助单元，在 sbx 自己的用户会话里执行 `set-property`。agentctl 把容器 id 交给它，交接用的本地套接字只允许 `agentctl` 连接。
+- 把 `set-property` 放在 sbx 已经拥有的用户会话里完成，agentctl 进程里不调用 `runuser`。
+- 在这件事情定下来之前，只启用 crun 档。
+
+### 会话工作区叶子创建不了
+
+两件事实叠在一起：
+
+- 单元是 `ProtectSystem=strict`，`ReadWritePaths` 只有 `/home/agentctl/data` 和 `/home/agentctl/secrets`。
+- `/home/sbx/workspaces` 和 `<bot>` 父目录属主是 `sbx`，模式 `0750`，agentctl 的 ACL 只有 `r`/`x`。
+
+`ensureWorkspace` 要在这个父目录下创建 `<session>` 叶子。服务进程既写不进这块路径，也没有在父目录里建目录的权限。
+
+候选：
+
+- 由 uid 1001 的辅助进程创建叶子并设成 `0777`。agentctl 只使用已经存在的叶子。
+- 部署时由 `sbx` 为会用到的会话预先建好叶子，至少包括每个 bot 的 root 会话。
+- 叶子不存在时由 sbx 的用户会话创建；controller 在叶子缺失时失败并记日志，不自己 `mkdir`。
