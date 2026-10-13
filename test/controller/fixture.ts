@@ -85,7 +85,15 @@ export async function startTestRig(options?: TestRigOptions): Promise<TestRig> {
   const secretsDir = path.join(root, "secrets");
   const { publicKey, privateKey } = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
   const keys: AccessKey[] = [{ kid: "test", key: publicKey }];
-  const token = signJwt(privateKey, { aud: "test-aud", iss: "https://example.cloudflareaccess.com", exp: Math.floor(Date.now() / 1000) + 600, email: "user@example.com" });
+  const issued = Math.floor(Date.now() / 1000);
+  const token = signJwt(privateKey, {
+    aud: "test-aud",
+    iss: "https://example.cloudflareaccess.com",
+    exp: issued + 600,
+    iat: issued,
+    nbf: issued,
+    email: "user@example.com",
+  });
   const models = options?.faux ?? new Map<BotName, ReturnType<typeof fauxProvider>>();
   if (models.size === 0) {
     for (const bot of BOTS) {
@@ -103,7 +111,13 @@ export async function startTestRig(options?: TestRigOptions): Promise<TestRig> {
     dataDir,
     workspaceRoot,
     port: 0,
-    access: { audience: "test-aud", issuer: "https://example.cloudflareaccess.com", keys },
+    access: {
+      audience: "test-aud",
+      issuer: "https://example.cloudflareaccess.com",
+      ownerEmail: "user@example.com",
+      origin: "https://chat.example.com",
+      keys,
+    },
     modelsFor: (bot) => {
       const faux = models.get(bot);
       if (faux === undefined) {

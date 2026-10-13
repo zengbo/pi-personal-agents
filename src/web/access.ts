@@ -15,11 +15,20 @@ export interface AccessKey {
   readonly key: crypto.KeyObject;
 }
 
+/** Accept nbf/iat this far ahead of the controller clock. Expiry is not extended. */
+export const ACCESS_CLOCK_SKEW_MS = 60_000;
+
 export interface AccessCheck {
   readonly audience: string;
-  readonly issuer?: string;
-  readonly keys: readonly AccessKey[];
+  readonly issuer: string;
+  readonly ownerEmail: string;
+  /** Full Origin header value, `https://<configured hostname>`. */
+  readonly origin: string;
+  keys: readonly AccessKey[];
   readonly now?: () => number;
+  readonly clockSkewMs?: number;
+  /** Rate-limited JWKS refetch. True when a fetch actually ran. */
+  refreshKeys?: () => Promise<boolean>;
 }
 
 export function verifyAccessJwt(token: string, check: AccessCheck): { email: string } {
@@ -47,18 +56,33 @@ export function verifyAccessJwt(token: string, check: AccessCheck): { email: str
   }
   const payload = parseJson(encodedPayload);
   const now = (check.now ?? Date.now)();
+  const skew = check.clockSkewMs ?? ACCESS_CLOCK_SKEW_MS;
   if (typeof payload.exp !== "number" || payload.exp * 1000 <= now) {
     throw new AccessError("exp");
+  }
+  if (typeof payload.nbf !== "number" || payload.nbf * 1000 > now + skew) {
+    throw new AccessError("nbf");
+  }
+  if (typeof payload.iat !== "number" || payload.iat * 1000 > now + skew) {
+    throw new AccessError("iat");
   }
   const audience = payload.aud;
   const audiences = Array.isArray(audience) ? audience : [audience];
   if (!audiences.includes(check.audience)) {
     throw new AccessError("aud");
   }
-  if (check.issuer !== undefined && payload.iss !== check.issuer) {
+  if (payload.iss !== check.issuer) {
     throw new AccessError("iss");
   }
-  return { email: typeof payload.email === "string" ? payload.email : "" };
+  if (typeof payload.email !== "string" || payload.email.length === 0 || payload.email !== check.ownerEmail) {
+    throw new AccessError("email");
+  }
+  return { email: payload.email };
+}
+
+/** State-changing requests must send this exact Origin. Arrays and omissions fail. */
+export function originAllowed(header: string | string[] | undefined, expected: string): boolean {
+  return typeof header === "string" && header.length > 0 && header === expected;
 }
 
 export function tokenFromRequest(header: string | undefined, cookie: string | undefined): string | undefined {

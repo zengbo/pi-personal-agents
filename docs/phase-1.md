@@ -12,7 +12,7 @@ Phase 0 的规格仍以 `docs/design.md` 与 `docs/implementation-plan.md` 为�
 
 不生成 `dist/`。启动顺序是拿 flock → `Harness.open` → 安装扩展 → `resume` → 只在 `127.0.0.1` 上听 HTTP。每个 bot 一个 SQLite（`<data>/<bot>.sqlite`）和一把 flock。持锁进程单独成组，并在 controller 的 pid 消失后退出，所以 `SIGKILL` 不会把锁留住。
 
-每个 bot 的设置里关掉了 compaction 和 retry。测试用 faux provider，不能让失败重试打成循环；生产入口走同一条 `startController`，所以这两项目前也是关的。
+每个 bot 的设置里关掉了 compaction 和 retry。测试用 faux provider，不能让失败重试打成循环；生产入口走同一条 `startController`，所以这两项目前也是关的。待办记在 `docs/follow-ups.md`。
 
 会话列表只返回 root。`Harness` 没有 `scanConversations`（那是 Storage 上的方法），fork 出来的会话还没接到 Web。
 
@@ -22,9 +22,11 @@ Phase 0 的规格仍以 `docs/design.md` 与 `docs/implementation-plan.md` 为�
 
 | 变量 | 作用 |
 |---|---|
-| `CLOUDFLARE_ACCESS_AUD` | JWT `aud` |
-| `CLOUDFLARE_ACCESS_JWKS_URL` | RS256 JWKS |
-| `CLOUDFLARE_ACCESS_TEAM_DOMAIN` | 可选，拼成 `iss`（`https://<domain>`） |
+| `CLOUDFLARE_ACCESS_AUD` | JWT `aud`，必填 |
+| `CLOUDFLARE_ACCESS_JWKS_URL` | RS256 JWKS，必填。启动时拉取，之后每 10 分钟刷新；未知 `kid` 再拉一次，两次至少隔 30 秒 |
+| `CLOUDFLARE_ACCESS_TEAM_DOMAIN` | 必填，拼成 `iss`（`https://<domain>`），每次都校验 |
+| `CLOUDFLARED_HOSTNAME` | 必填。POST 和 WebSocket 的 `Origin` 必须等于 `https://<hostname>` |
+| `PPA_OWNER_EMAIL` | 必填。JWT `email` 必须与它完全一致，审批人只记这个邮箱 |
 | `PPA_DATA_DIR` | 默认 `/home/agentctl/data` |
 | `PPA_SECRETS_DIR` | 默认 `/home/agentctl/secrets` |
 | `PPA_WORKSPACE_ROOT` | 默认 `/home/sbx/workspaces` |
@@ -35,7 +37,9 @@ Phase 0 的规格仍以 `docs/design.md` 与 `docs/implementation-plan.md` 为�
 
 ## HTTP
 
-全部要求 Access JWT：请求头 `Cf-Access-Jwt-Assertion`，或 cookie `CF_Authorization`。缺失、算法不是 RS256、签名、`aud`、`iss`、`exp` 任一失败都是 401。
+全部要求 Access JWT：请求头 `Cf-Access-Jwt-Assertion`，或 cookie `CF_Authorization`。缺失、算法不是 RS256、签名、`aud`、`iss`、`exp`、`nbf`、`iat`、`email` 任一失败都是 401。`iss` 必须等于 `https://<CLOUDFLARE_ACCESS_TEAM_DOMAIN>`。`nbf` 和 `iat` 必须是数字，比控制器时钟超前超过 60 秒就拒绝。过期（`exp`）没有这 60 秒的宽限。`email` 缺失、为空、或不是 `PPA_OWNER_EMAIL` 都拒绝，不会退回成 `"user"`。
+
+POST（审批、提交、登录码）和 WebSocket 升级还要 `Origin` 与 `https://<CLOUDFLARED_HOSTNAME>` 完全一致，包括带着 JWT 头的请求。缺 Origin 或别的站点是 403，而且先于 JWT 检查。GET 不查 Origin。审批和提交的正文必须是 JSON 对象，坏 JSON 是 400 `bad json`，不会把异常抛出进程。WebSocket 上的坏 JSON 只关掉那条连接。
 
 | 方法 | 路径 | 作用 |
 |---|---|---|
@@ -49,7 +53,7 @@ Phase 0 的规格仍以 `docs/design.md` 与 `docs/implementation-plan.md` 为�
 | POST | `/api/approvals/:id` | `{ decision: "allow_once" \| "allow_always" \| "deny" }` |
 | GET | `/api/audit` | 审计 JSONL 的当前内容 |
 
-WebSocket 任意路径升级。客户端发 `{ type: "watch", bot, conversationId }` 收 `view` 与 `approvals`；`submit` 与 HTTP 相同；`decide` 用 JWT 里的 email 当用户会话。服务端帧不打码。浏览器页靠 Access cookie，因为页面里的 `WebSocket` 不能加自定义头。
+WebSocket 任意路径升级，同样要上面的 Origin。客户端发 `{ type: "watch", bot, conversationId }` 收 `view` 与 `approvals`；`submit` 与 HTTP 相同；`decide` 用 JWT 里的 email 当用户会话。服务端帧不打码。浏览器页靠 Access cookie，因为页面里的 `WebSocket` 不能加自定义头。
 
 ## 策略
 

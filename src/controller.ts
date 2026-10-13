@@ -3,6 +3,7 @@
  * Importing this module does not open sockets; the guard below does.
  */
 import { spawn } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import { pathToFileURL } from "node:url";
 import { createModels } from "@earendil-works/pi-ai/models";
@@ -16,18 +17,34 @@ import { PolicyEngine } from "./policy/engine.ts";
 import { PolicyStore } from "./policy/store.ts";
 import { createPodmanDriver, UnixPodmanClient, type CommandRunner } from "./sandbox/podman.ts";
 import { SandboxPool } from "./sandbox/pool.ts";
-import type { AccessKey } from "./web/access.ts";
-import crypto from "node:crypto";
+import type { AccessCheck, AccessKey } from "./web/access.ts";
+import { JwksCache } from "./web/jwks.ts";
 
 async function main(): Promise<void> {
   const audience = requiredEnv("CLOUDFLARE_ACCESS_AUD");
   const jwksUrl = requiredEnv("CLOUDFLARE_ACCESS_JWKS_URL");
-  const issuer = process.env.CLOUDFLARE_ACCESS_TEAM_DOMAIN;
+  const teamDomain = requiredEnv("CLOUDFLARE_ACCESS_TEAM_DOMAIN");
+  const hostname = requiredEnv("CLOUDFLARED_HOSTNAME");
+  const ownerEmail = requiredEnv("PPA_OWNER_EMAIL");
   const dataDir = process.env.PPA_DATA_DIR ?? "/home/agentctl/data";
   const secretsDir = process.env.PPA_SECRETS_DIR ?? "/home/agentctl/secrets";
   const workspaceRoot = process.env.PPA_WORKSPACE_ROOT ?? "/home/sbx/workspaces";
   const port = Number(process.env.PPA_PORT ?? "8787");
-  const keys = await loadJwks(jwksUrl);
+  const access: AccessCheck = {
+    audience,
+    issuer: httpsIssuer(teamDomain),
+    ownerEmail,
+    origin: httpsOrigin(hostname),
+    keys: [],
+  };
+  const jwks = new JwksCache(() => loadJwks(jwksUrl));
+  access.keys = [...(await jwks.refresh(true)).keys];
+  access.refreshKeys = async () => {
+    const result = await jwks.refetchForUnknownKid();
+    access.keys = [...result.keys];
+    return result.fetched;
+  };
+  jwks.start();
   const store = new FileCredentialStore(secretsDir);
   const models = createModels({ credentials: store });
   models.setProvider(openaiProvider());
@@ -43,11 +60,7 @@ async function main(): Promise<void> {
     dataDir,
     workspaceRoot,
     port,
-    access: {
-      audience,
-      issuer: issuer === undefined ? undefined : `https://${issuer}`,
-      keys,
-    },
+    access,
     modelsFor: () => models,
     modelRef: { provider: "openai", modelId: process.env.PPA_MODEL_ID ?? "gpt-5.1" },
     pool,
@@ -96,6 +109,20 @@ async function loadJwks(url: string): Promise<AccessKey[]> {
     throw new Error("access jwks had no rsa keys");
   }
   return keys;
+}
+
+function httpsIssuer(teamDomain: string): string {
+  if (teamDomain.includes("://") || teamDomain.includes("/") || teamDomain.length === 0) {
+    throw new Error("CLOUDFLARE_ACCESS_TEAM_DOMAIN must be a hostname");
+  }
+  return `https://${teamDomain}`;
+}
+
+function httpsOrigin(hostname: string): string {
+  if (hostname.includes("://") || hostname.includes("/") || hostname.length === 0) {
+    throw new Error("CLOUDFLARED_HOSTNAME must be a hostname");
+  }
+  return `https://${hostname}`;
 }
 
 function requiredEnv(name: string): string {

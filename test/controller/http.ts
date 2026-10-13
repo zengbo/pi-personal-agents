@@ -2,14 +2,19 @@ import crypto from "node:crypto";
 import http from "node:http";
 import net from "node:net";
 
+export const TEST_ORIGIN = "https://chat.example.com";
+
 export function httpCall(
   port: number,
   method: string,
   pathname: string,
-  options?: { token?: string; cookie?: boolean; body?: string },
+  options?: { token?: string; cookie?: boolean; body?: string; origin?: string | false },
 ): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
     const headers: Record<string, string> = {};
+    if (method !== "GET" && method !== "HEAD" && options?.origin !== false) {
+      headers.Origin = options?.origin ?? TEST_ORIGIN;
+    }
     if (options?.token !== undefined) {
       if (options.cookie === true) {
         headers.Cookie = `CF_Authorization=${options.token}`;
@@ -42,7 +47,11 @@ export interface TestSocket {
   close(): void;
 }
 
-export function openTestSocket(port: number, token: string | undefined): Promise<TestSocket> {
+export function openTestSocket(
+  port: number,
+  token: string | undefined,
+  options?: { origin?: string | false },
+): Promise<TestSocket> {
   return new Promise((resolve, reject) => {
     const key = crypto.randomBytes(16).toString("base64");
     const lines = [
@@ -53,6 +62,9 @@ export function openTestSocket(port: number, token: string | undefined): Promise
       `Sec-WebSocket-Key: ${key}`,
       "Sec-WebSocket-Version: 13",
     ];
+    if (options?.origin !== false) {
+      lines.push(`Origin: ${options?.origin ?? TEST_ORIGIN}`);
+    }
     if (token !== undefined) {
       lines.push(`Cf-Access-Jwt-Assertion: ${token}`);
     }
@@ -61,9 +73,11 @@ export function openTestSocket(port: number, token: string | undefined): Promise
     });
     let buffer = Buffer.alloc(0);
     let handshake = false;
+    let closed: Error | undefined;
     const messages: unknown[] = [];
     const waiters: { resolve: (value: unknown) => void; reject: (error: Error) => void; timer: NodeJS.Timeout }[] = [];
     const fail = (error: Error): void => {
+      closed ??= error;
       if (!handshake) {
         reject(error);
       }
@@ -107,6 +121,9 @@ export function openTestSocket(port: number, token: string | undefined): Promise
             socket.write(clientFrame(Buffer.from(text)));
           },
           next(timeoutMs = 10_000) {
+            if (closed !== undefined) {
+              return Promise.reject(closed);
+            }
             const queued = messages.shift();
             if (queued !== undefined) {
               return Promise.resolve(queued);
@@ -135,6 +152,7 @@ export function openTestSocket(port: number, token: string | undefined): Promise
       }
     });
     socket.on("error", (error) => fail(error));
+    socket.on("close", () => fail(new Error("websocket closed")));
   });
 }
 

@@ -2,7 +2,7 @@ import http from "node:http";
 import type { Duplex } from "node:stream";
 import type { AuditEvent } from "../policy/audit.ts";
 import type { ApprovalChoice, ApprovalRequest } from "../policy/engine.ts";
-import { tokenFromRequest, verifyAccessJwt, type AccessCheck } from "./access.ts";
+import { AccessError, originAllowed, tokenFromRequest, verifyAccessJwt, type AccessCheck } from "./access.ts";
 import { WEB_PAGE } from "./page.ts";
 import { acceptWebSocket } from "./ws.ts";
 
@@ -38,7 +38,13 @@ export async function startWeb(app: WebApp, options: { host?: string; port: numb
     throw new Error("the web server only binds 127.0.0.1");
   }
   const server = http.createServer((request, response) => {
-    void handle(app, request, response);
+    void handle(app, request, response).catch(() => {
+      if (response.headersSent) {
+        response.destroy();
+        return;
+      }
+      send(response, 500, "error");
+    });
   });
   const sockets = new Set<Duplex>();
   server.on("connection", (socket) => {
@@ -48,18 +54,7 @@ export async function startWeb(app: WebApp, options: { host?: string; port: numb
     });
   });
   server.on("upgrade", (request, socket, head) => {
-    const claims = authorize(app, request.headers["cf-access-jwt-assertion"], request.headers.cookie);
-    if (claims === undefined) {
-      socket.write("HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-      socket.end();
-      return;
-    }
-    const client = acceptWebSocket(request, socket, head, (text) => {
-      void onSocket(app, claims.email, client, text);
-    });
-    if (client === undefined) {
-      socket.end();
-    }
+    void acceptUpgrade(app, request, socket, head);
   });
   await new Promise<void>((resolve) => {
     server.listen(options.port, host, () => resolve());
@@ -84,21 +79,66 @@ export async function startWeb(app: WebApp, options: { host?: string; port: numb
   };
 }
 
-function authorize(app: WebApp, header: string | string[] | undefined, cookie: string | string[] | undefined): { email: string } | undefined {
+async function acceptUpgrade(
+  app: WebApp,
+  request: http.IncomingMessage,
+  socket: Duplex,
+  head: Buffer,
+): Promise<void> {
+  if (!originAllowed(request.headers.origin, app.access.origin)) {
+    socket.write("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    socket.end();
+    return;
+  }
+  const claims = await authorize(app, request.headers["cf-access-jwt-assertion"], request.headers.cookie);
+  if (claims === undefined) {
+    socket.write("HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+    socket.end();
+    return;
+  }
+  const client = acceptWebSocket(request, socket, head, (text) => {
+    void onSocket(app, claims.email, client, text).catch(() => {
+      client?.close();
+    });
+  });
+  if (client === undefined) {
+    socket.end();
+  }
+}
+
+async function authorize(
+  app: WebApp,
+  header: string | string[] | undefined,
+  cookie: string | string[] | undefined,
+): Promise<{ email: string } | undefined> {
   const token = tokenFromRequest(one(header), one(cookie));
   if (token === undefined) {
     return undefined;
   }
   try {
     return verifyAccessJwt(token, app.access);
-  } catch {
+  } catch (error) {
+    if (error instanceof AccessError && error.reason === "kid" && app.access.refreshKeys !== undefined) {
+      const fetched = await app.access.refreshKeys();
+      if (fetched) {
+        try {
+          return verifyAccessJwt(token, app.access);
+        } catch {
+          return undefined;
+        }
+      }
+    }
     return undefined;
   }
 }
 
 async function handle(app: WebApp, request: http.IncomingMessage, response: http.ServerResponse): Promise<void> {
   const url = new URL(request.url ?? "/", "http://127.0.0.1");
-  const claims = authorize(app, request.headers["cf-access-jwt-assertion"], request.headers.cookie);
+  if (request.method === "POST" && !originAllowed(request.headers.origin, app.access.origin)) {
+    send(response, 403, "forbidden");
+    return;
+  }
+  const claims = await authorize(app, request.headers["cf-access-jwt-assertion"], request.headers.cookie);
   if (claims === undefined) {
     send(response, 401, "unauthorized");
     return;
@@ -132,8 +172,13 @@ async function handle(app: WebApp, request: http.IncomingMessage, response: http
   }
   const approval = /^\/api\/approvals\/([^/]+)$/.exec(url.pathname);
   if (request.method === "POST" && approval !== null) {
-    const body = JSON.parse(await readBody(request)) as { decision?: ApprovalChoice };
-    if (body.decision !== "allow_once" && body.decision !== "allow_always" && body.decision !== "deny") {
+    const body = parseObject(await readBody(request));
+    if (body === undefined) {
+      send(response, 400, "bad json");
+      return;
+    }
+    const decision = body.decision;
+    if (decision !== "allow_once" && decision !== "allow_always" && decision !== "deny") {
       send(response, 400, "bad decision");
       return;
     }
@@ -142,7 +187,7 @@ async function handle(app: WebApp, request: http.IncomingMessage, response: http
       send(response, 400, "bad id");
       return;
     }
-    app.decide(id, body.decision, claims.email || "user");
+    app.decide(id, decision, claims.email);
     send(response, 200, "ok");
     return;
   }
@@ -164,17 +209,18 @@ async function handle(app: WebApp, request: http.IncomingMessage, response: http
       send(response, 400, "bad path");
       return;
     }
-    const body = JSON.parse(await readBody(request)) as {
-      content?: string;
-      requestId?: string;
-      whenBusy?: "steer" | "followUp";
-    };
+    const body = parseObject(await readBody(request));
+    if (body === undefined) {
+      send(response, 400, "bad json");
+      return;
+    }
+    const whenBusy = body.whenBusy === "steer" || body.whenBusy === "followUp" ? body.whenBusy : undefined;
     const result = await app.submit({
       bot,
       conversationId,
-      content: body.content ?? "",
-      requestId: body.requestId ?? `web-${Date.now()}`,
-      whenBusy: body.whenBusy,
+      content: typeof body.content === "string" ? body.content : "",
+      requestId: typeof body.requestId === "string" ? body.requestId : `web-${Date.now()}`,
+      whenBusy,
     });
     send(response, 200, JSON.stringify(result), "application/json");
     return;
@@ -185,48 +231,46 @@ async function handle(app: WebApp, request: http.IncomingMessage, response: http
 async function onSocket(
   app: WebApp,
   email: string,
-  client: { send(text: string): void } | undefined,
+  client: { send(text: string): void; close(): void } | undefined,
   text: string,
 ): Promise<void> {
-  if (client === undefined) {
+  if (client === undefined || email.length === 0) {
+    client?.close();
     return;
   }
-  const message = JSON.parse(text) as {
-    type?: string;
-    bot?: string;
-    conversationId?: string;
-    content?: string;
-    requestId?: string;
-    whenBusy?: "steer" | "followUp";
-    id?: string;
-    decision?: ApprovalChoice;
-  };
-  if (message.type === "watch" && message.bot !== undefined && message.conversationId !== undefined) {
-    const entries = await app.view(message.bot, message.conversationId);
-    client.send(JSON.stringify({ type: "view", bot: message.bot, conversationId: message.conversationId, entries }));
+  const message = parseObject(text);
+  if (message === undefined) {
+    client.close();
+    return;
+  }
+  const type = asString(message.type);
+  const bot = asString(message.bot);
+  const conversationId = asString(message.conversationId);
+  if (type === "watch" && bot !== undefined && conversationId !== undefined) {
+    const entries = await app.view(bot, conversationId);
+    client.send(JSON.stringify({ type: "view", bot, conversationId, entries }));
     client.send(JSON.stringify({ type: "approvals", items: app.approvals() }));
-    await app.watch(message.bot, message.conversationId, (next) => {
-      client.send(JSON.stringify({ type: "view", bot: message.bot, conversationId: message.conversationId, entries: next }));
+    await app.watch(bot, conversationId, (next) => {
+      client.send(JSON.stringify({ type: "view", bot, conversationId, entries: next }));
       client.send(JSON.stringify({ type: "approvals", items: app.approvals() }));
     });
     return;
   }
-  if (message.type === "submit" && message.bot !== undefined && message.conversationId !== undefined) {
+  if (type === "submit" && bot !== undefined && conversationId !== undefined) {
+    const whenBusy = message.whenBusy === "steer" || message.whenBusy === "followUp" ? message.whenBusy : undefined;
     await app.submit({
-      bot: message.bot,
-      conversationId: message.conversationId,
-      content: message.content ?? "",
-      requestId: message.requestId ?? `ws-${Date.now()}`,
-      whenBusy: message.whenBusy,
+      bot,
+      conversationId,
+      content: asString(message.content) ?? "",
+      requestId: asString(message.requestId) ?? `ws-${Date.now()}`,
+      whenBusy,
     });
     return;
   }
-  if (
-    message.type === "decide" &&
-    message.id !== undefined &&
-    (message.decision === "allow_once" || message.decision === "allow_always" || message.decision === "deny")
-  ) {
-    app.decide(message.id, message.decision, email || "user");
+  const decision = message.decision;
+  const id = asString(message.id);
+  if (type === "decide" && id !== undefined && (decision === "allow_once" || decision === "allow_always" || decision === "deny")) {
+    app.decide(id, decision, email);
     client.send(JSON.stringify({ type: "approvals", items: app.approvals() }));
   }
 }
@@ -243,6 +287,22 @@ function readBody(request: http.IncomingMessage): Promise<string> {
     request.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
     request.on("error", reject);
   });
+}
+
+function asString(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
+}
+
+function parseObject(text: string): Record<string, unknown> | undefined {
+  try {
+    const value = JSON.parse(text) as unknown;
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      return undefined;
+    }
+    return value as Record<string, unknown>;
+  } catch {
+    return undefined;
+  }
 }
 
 function one(value: string | string[] | undefined): string | undefined {

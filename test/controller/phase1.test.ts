@@ -272,7 +272,13 @@ function treeContains(dir: string, needle: string): boolean {
 function stubApp(): WebApp {
   return {
     bots: ["chief"],
-    access: { audience: "test-aud", keys: [] },
+    access: {
+      audience: "test-aud",
+      issuer: "https://example.cloudflareaccess.com",
+      ownerEmail: "user@example.com",
+      origin: "https://chat.example.com",
+      keys: [],
+    },
     loginHtml: () => "",
     submitLogin: () => undefined,
     listConversations: () => Promise.resolve([]),
