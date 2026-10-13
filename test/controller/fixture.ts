@@ -12,7 +12,7 @@ import { startController, type RunningController } from "../../src/controller/ru
 import { AuditLog } from "../../src/policy/audit.ts";
 import { PolicyEngine } from "../../src/policy/engine.ts";
 import { PolicyStore } from "../../src/policy/store.ts";
-import type { PodmanClient, PodmanExecResult } from "../../src/sandbox/podman.ts";
+import type { PodmanClient, PodmanExecOptions, PodmanExecResult } from "../../src/sandbox/podman.ts";
 import { createPodmanDriver } from "../../src/sandbox/podman.ts";
 import { SandboxPool } from "../../src/sandbox/pool.ts";
 import { startWorkspaceHelper, type WorkspaceHelper } from "../../src/sandbox/workspace-helper.ts";
@@ -46,7 +46,7 @@ export interface TestRig {
 
 export class FakePodman implements PodmanClient {
   readonly events: string[] = [];
-  readonly execs: { command: string | readonly string[]; env?: Readonly<Record<string, string>> }[] = [];
+  readonly execs: { command: string | readonly string[]; env?: Readonly<Record<string, string>>; stdin?: Uint8Array }[] = [];
   spec: SandboxSpec | undefined;
   private readonly execImpl: PodmanClient["exec"] | undefined;
 
@@ -72,9 +72,9 @@ export class FakePodman implements PodmanClient {
     runtime: RuntimeKind,
     id: string,
     command: string | readonly string[],
-    options: { readonly cwd?: string; readonly env?: Readonly<Record<string, string>> } | undefined,
+    options: PodmanExecOptions | undefined,
   ): Promise<PodmanExecResult> {
-    this.execs.push({ command, env: options?.env });
+    this.execs.push({ command, env: options?.env, stdin: options?.stdin });
     if (this.execImpl !== undefined) {
       return this.execImpl(runtime, id, command, options);
     }

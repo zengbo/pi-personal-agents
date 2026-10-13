@@ -15,7 +15,7 @@
 模块：
 1. `controller/`：每 bot 一个 Harness + SQLite（`/home/agentctl/data/<bot>.sqlite`，flock 单写者）；启动顺序 拿锁→open→安装扩展→resume→HTTP；优雅关闭。
 2. `auth/`：pi-ai `Models` + ChatGPT OAuth（`openaiChatGPTOAuth`），持久化 `CredentialStore`（`/home/agentctl/secrets`，0600 文件，原子写）；一次性登录页面。
-3. `sandbox/`：`SandboxExecutionEnv`（Podman REST API over unix socket）。生产只启动 crun；runsc 在有 set-property 路径之前不启动。会话叶子由 sbx helper 以 `0700` 创建。并发 3 + 队列；空闲停止；symlink 安全读取（openat2 / lstat）。
+3. `sandbox/`：`SandboxExecutionEnv`（Podman REST API over unix socket）。生产只启动 crun；runsc 在有 set-property 路径之前不启动。会话叶子由 sbx helper 以 `0700` 创建。并发 3 + 队列；空闲停止；文件操作在容器内 exec，`realpath` 必须落在 `/workspace` 下。
 4. `policy/`：`beforeTool` hook，规则库（allow/ask/deny，once/always，过期），审批请求队列，fail-closed，`api.memo` 持久化，append-only 审计。
 5. `bots/`：`chief`（规划、delegate、汇总）、`researcher`（只读网络检索）、`ops`（编码/测试，危险操作需审批）；`delegate` 工具经 controller 以 `requestId` submit 到子 bot 持久 conversation。
 6. `web/`：HTTP+WebSocket 绑定 127.0.0.1；校验 Cf-Access JWT；bot 列表、会话、流式（viewState + watch）、steer、审批卡片、审计页。

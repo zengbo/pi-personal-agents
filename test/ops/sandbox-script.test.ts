@@ -108,6 +108,34 @@ describe("VPS environment script", () => {
     expect(listed).toContain("H14");
   });
 
+  it("keeps runsc checks in the catalog and marks them host-only optional", () => {
+    const result = runSourced(`
+      set -euo pipefail
+      source "$PPA_SCRIPT"
+      optional_host_only_runsc T1a-runsc
+      optional_host_only_runsc T6b-runsc
+      optional_host_only_runsc H6
+      optional_host_only_runsc H8
+      if optional_host_only_runsc T1a-crun; then
+        echo "crun checks stay required" >&2
+        exit 1
+      fi
+      if optional_host_only_runsc H15; then
+        echo "H15 stays required" >&2
+        exit 1
+      fi
+      if optional_host_only_runsc T9; then
+        echo "T9 stays required" >&2
+        exit 1
+      fi
+    `);
+    expect(result.status).toBe(0);
+    expect(script).toContain("host-only optional while crun-only");
+    expect(script).toContain("test_T1a_runsc()");
+    expect(script).toContain("test_H6()");
+    expect(script).toContain("test_H8()");
+  });
+
   it("fails require_dir_mode on mode 0755 even when the owner matches", () => {
     const result = runSourced(`
       set -euo pipefail

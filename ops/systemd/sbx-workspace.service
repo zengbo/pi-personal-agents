@@ -2,6 +2,9 @@
 # Do not copy this onto racknerd_us from an agent session.
 # User=sbx so the leaf owner is sbx. The controller unit does not gain this
 # ReadWritePaths entry, and its NoNewPrivileges / ProtectSystem stay unchanged.
+# ProtectHome=read-only keeps /home visible and read-only. ReadWritePaths then
+# re-opens the workspace tree. ProtectHome=yes hides /home and often ignores
+# ReadWritePaths, so this unit does not use it.
 # Enable the socket unit, not this service. systemd starts it on the first connection.
 
 [Unit]
@@ -17,7 +20,7 @@ UMask=0077
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
-ProtectHome=yes
+ProtectHome=read-only
 ReadWritePaths=/home/sbx/workspaces
 Environment=PPA_WORKSPACE_ROOT=/home/sbx/workspaces
 ExecStart=/usr/bin/node --experimental-strip-types /usr/local/lib/pi-personal-agents/sbx-workspace.ts

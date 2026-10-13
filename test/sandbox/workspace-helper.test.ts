@@ -12,6 +12,7 @@ import {
   openatCreateLeaf,
   requestSessionLeaf,
   startWorkspaceHelper,
+  systemdListenFd,
   WorkspaceHelperError,
 } from "../../src/sandbox/workspace-helper.ts";
 
@@ -193,11 +194,38 @@ describe("sbx workspace helper", () => {
     expect(service).toContain("User=sbx");
     expect(service).toContain("NoNewPrivileges=yes");
     expect(service).toContain("ProtectSystem=strict");
+    expect(service.split("\n").find((line) => line.startsWith("ProtectHome="))).toBe("ProtectHome=read-only");
     expect(service).toContain("ReadWritePaths=/home/sbx/workspaces");
+    const deployment = readFileSync(path.resolve("docs/deployment.md"), "utf8");
+    expect(deployment).toContain("ProtectHome=read-only");
+    expect(deployment).toContain("systemctl show sbx-workspace.service");
     expect(socket.split("\n").find((line) => line.startsWith("SocketMode="))).toBe("SocketMode=0660");
     expect(parentAclArgs("/home/sbx/workspaces/ops")).toEqual(["setfacl", "-m", "u:agentctl:rx", "/home/sbx/workspaces/ops"]);
     expect(refuseDisabledRuntime("runsc")).toBe(RUNSC_DISABLED_MESSAGE);
     expect(refuseDisabledRuntime("crun")).toBeUndefined();
+  });
+
+  it("accepts the listen fd only when LISTEN_PID is unset or this process", () => {
+    const previousFds = process.env.LISTEN_FDS;
+    const previousPid = process.env.LISTEN_PID;
+    try {
+      delete process.env.LISTEN_FDS;
+      delete process.env.LISTEN_PID;
+      expect(systemdListenFd()).toBeUndefined();
+      process.env.LISTEN_FDS = "1";
+      delete process.env.LISTEN_PID;
+      expect(systemdListenFd()).toBe(3);
+      process.env.LISTEN_PID = String(process.pid);
+      expect(systemdListenFd()).toBe(3);
+      process.env.LISTEN_PID = String(process.pid + 1);
+      expect(systemdListenFd()).toBeUndefined();
+      process.env.LISTEN_FDS = "2";
+      process.env.LISTEN_PID = String(process.pid);
+      expect(systemdListenFd()).toBeUndefined();
+    } finally {
+      restoreEnv("LISTEN_FDS", previousFds);
+      restoreEnv("LISTEN_PID", previousPid);
+    }
   });
 });
 
@@ -217,6 +245,14 @@ function rawRequest(socketPath: string, body: { bot: string; session: string }):
       socket.write(`${JSON.stringify(body)}\n`);
     });
   });
+}
+
+function restoreEnv(name: "LISTEN_FDS" | "LISTEN_PID", value: string | undefined): void {
+  if (value === undefined) {
+    delete process.env[name];
+    return;
+  }
+  process.env[name] = value;
 }
 
 function tree(): string {

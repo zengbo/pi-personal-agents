@@ -8,6 +8,15 @@ export interface PodmanExecResult {
   readonly exitCode: number;
   readonly stdout: string;
   readonly stderr: string;
+  /** Raw stdout frames. File operations use this so binary writes survive the exec. */
+  readonly stdoutBytes?: Uint8Array;
+}
+
+export interface PodmanExecOptions {
+  readonly cwd?: string;
+  readonly env?: Readonly<Record<string, string>>;
+  /** Present only when the container command must read stdin (tee). */
+  readonly stdin?: Uint8Array;
 }
 
 export interface PodmanClient {
@@ -18,7 +27,7 @@ export interface PodmanClient {
     runtime: RuntimeKind,
     id: string,
     command: string | readonly string[],
-    options: { readonly cwd?: string; readonly env?: Readonly<Record<string, string>> } | undefined,
+    options: PodmanExecOptions | undefined,
   ): Promise<PodmanExecResult>;
 }
 
@@ -59,7 +68,7 @@ export function createPodmanDriver(client: PodmanClient): SandboxDriver {
 }
 
 /** Docker/Podman multiplexed exec frames: 1 byte stream, 3 zero, uint32 BE length. */
-export function demuxPodmanFrames(buffer: Buffer): { stdout: string; stderr: string } {
+export function demuxPodmanFrameBuffers(buffer: Buffer): { stdout: Buffer; stderr: Buffer } {
   const stdout: Buffer[] = [];
   const stderr: Buffer[] = [];
   let offset = 0;
@@ -79,10 +88,35 @@ export function demuxPodmanFrames(buffer: Buffer): { stdout: string; stderr: str
     }
     offset = end;
   }
+  return { stdout: Buffer.concat(stdout), stderr: Buffer.concat(stderr) };
+}
+
+export function demuxPodmanFrames(buffer: Buffer): { stdout: string; stderr: string } {
+  const frames = demuxPodmanFrameBuffers(buffer);
   return {
-    stdout: Buffer.concat(stdout).toString("utf8"),
-    stderr: Buffer.concat(stderr).toString("utf8"),
+    stdout: frames.stdout.toString("utf8"),
+    stderr: frames.stderr.toString("utf8"),
   };
+}
+
+/** One stdin frame. Callers chunk large payloads before sending. */
+export function muxPodmanFrame(stream: number, payload: Buffer): Buffer {
+  const header = Buffer.alloc(8);
+  header[0] = stream & 0xff;
+  header.writeUInt32BE(payload.length, 4);
+  return Buffer.concat([header, payload]);
+}
+
+function muxStdinFrames(payload: Buffer): Buffer {
+  if (payload.length === 0) {
+    return Buffer.alloc(0);
+  }
+  const frames: Buffer[] = [];
+  const chunkSize = 64 * 1024;
+  for (let offset = 0; offset < payload.length; offset += chunkSize) {
+    frames.push(muxPodmanFrame(0, payload.subarray(offset, Math.min(payload.length, offset + chunkSize))));
+  }
+  return Buffer.concat(frames);
 }
 
 export interface PodmanSockets {
@@ -118,14 +152,16 @@ export class UnixPodmanClient implements PodmanClient {
     runtime: RuntimeKind,
     id: string,
     command: string | readonly string[],
-    options: { readonly cwd?: string; readonly env?: Readonly<Record<string, string>> } | undefined,
+    options: PodmanExecOptions | undefined,
   ): Promise<PodmanExecResult> {
     const cmd = typeof command === "string" ? ["bash", "-lc", command] : [...command];
+    const stdin = options?.stdin === undefined ? undefined : Buffer.from(options.stdin);
     const created = await this.request(
       runtime,
       "POST",
       `/v4.0.0/libpod/containers/${encodeURIComponent(id)}/exec`,
       Buffer.from(JSON.stringify({
+        AttachStdin: stdin !== undefined,
         AttachStdout: true,
         AttachStderr: true,
         Tty: false,
@@ -139,17 +175,22 @@ export class UnixPodmanClient implements PodmanClient {
     if (typeof execId !== "string") {
       throw new Error("podman exec did not return an id");
     }
-    const streamed = await this.request(
+    const streamed = await this.hijack(
       runtime,
       "POST",
       `/v4.0.0/libpod/exec/${encodeURIComponent(execId)}/start`,
       Buffer.from(JSON.stringify({ Detach: false, Tty: false })),
-      { Upgrade: "tcp", Connection: "Upgrade" },
+      stdin,
     );
     const inspected = await this.request(runtime, "GET", `/v4.0.0/libpod/exec/${encodeURIComponent(execId)}/json`, Buffer.alloc(0));
     const exitCode = (JSON.parse(inspected.toString("utf8")) as { ExitCode?: number }).ExitCode ?? 1;
-    const frames = demuxPodmanFrames(streamed);
-    return { exitCode, stdout: frames.stdout, stderr: frames.stderr };
+    const frames = demuxPodmanFrameBuffers(streamed);
+    return {
+      exitCode,
+      stdout: frames.stdout.toString("utf8"),
+      stderr: frames.stderr.toString("utf8"),
+      stdoutBytes: frames.stdout,
+    };
   }
 
   private request(
@@ -192,6 +233,91 @@ export class UnixPodmanClient implements PodmanClient {
         },
       );
       req.on("error", reject);
+      req.end(body);
+    });
+  }
+
+  /**
+   * Exec start may answer 200 with a body, or 101 and then raw frames.
+   * Stdin is written only on the upgraded socket, as stream-0 frames, then the write side is closed.
+   */
+  private hijack(
+    runtime: RuntimeKind,
+    method: string,
+    requestPath: string,
+    body: Buffer,
+    stdin: Buffer | undefined,
+  ): Promise<Buffer> {
+    if (runtime !== "crun") {
+      return Promise.reject(new Error(RUNSC_DISABLED_MESSAGE));
+    }
+    const socketPath = this.sockets.crun;
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (payload: Buffer): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        resolve(payload);
+      };
+      const fail = (error: unknown): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        reject(error instanceof Error ? error : new Error("podman exec failed"));
+      };
+      const req = http.request(
+        {
+          socketPath,
+          path: requestPath,
+          method,
+          headers: {
+            "Content-Type": "application/json",
+            "Content-Length": body.length,
+            Upgrade: "tcp",
+            Connection: "Upgrade",
+          },
+        },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on("data", (chunk: Buffer) => {
+            chunks.push(chunk);
+          });
+          res.on("end", () => {
+            const status = res.statusCode ?? 500;
+            if (status >= 400) {
+              fail(new Error(`podman ${method} ${requestPath} failed (${status})`));
+              return;
+            }
+            if (stdin !== undefined) {
+              fail(new Error("podman exec start did not upgrade for stdin"));
+              return;
+            }
+            finish(Buffer.concat(chunks));
+          });
+          res.on("error", fail);
+        },
+      );
+      req.on("upgrade", (_response, socket, head) => {
+        const chunks: Buffer[] = [];
+        if (head.length > 0) {
+          chunks.push(head);
+        }
+        socket.on("data", (chunk: Buffer) => {
+          chunks.push(chunk);
+        });
+        socket.on("error", fail);
+        socket.on("end", () => {
+          finish(Buffer.concat(chunks));
+        });
+        if (stdin !== undefined && stdin.length > 0) {
+          socket.write(muxStdinFrames(stdin));
+        }
+        socket.end();
+      });
+      req.on("error", fail);
       req.end(body);
     });
   }

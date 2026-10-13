@@ -67,29 +67,29 @@ T5a-crun	crun: proxy CONNECT to an allowlisted host returns 200
 T5b-crun	crun: proxy CONNECT to a non-allowlisted host returns 403
 T6a-crun	crun: Podman socket is not visible
 T6b-crun	crun: /home/agentctl is not visible
-T1a-runsc	runsc: id uid is 1000
-T1b-runsc	runsc: id gid is 1000
-T1c-runsc	runsc: effective capabilities are empty
-T1d-runsc	runsc: NoNewPrivs is set
-T2a-runsc	runsc: / is read-only
-T2b-runsc	runsc: /tmp is writable
-T2c-runsc	runsc: /home/sbx is writable
-T3a-runsc	runsc: allocation past 768m is OOM-killed
-T3c-runsc	runsc: fork past 256 pids fails or the sandbox is killed
-T3e-runsc	runsc: scope CPU quota is 100%
-T4a-runsc	runsc: direct egress fails
-T5a-runsc	runsc: proxy CONNECT to an allowlisted host returns 200
-T5b-runsc	runsc: proxy CONNECT to a non-allowlisted host returns 403
-T6a-runsc	runsc: Podman socket is not visible
-T6b-runsc	runsc: /home/agentctl is not visible
+T1a-runsc	runsc: id uid is 1000 (host-only optional while crun-only)
+T1b-runsc	runsc: id gid is 1000 (host-only optional while crun-only)
+T1c-runsc	runsc: effective capabilities are empty (host-only optional while crun-only)
+T1d-runsc	runsc: NoNewPrivs is set (host-only optional while crun-only)
+T2a-runsc	runsc: / is read-only (host-only optional while crun-only)
+T2b-runsc	runsc: /tmp is writable (host-only optional while crun-only)
+T2c-runsc	runsc: /home/sbx is writable (host-only optional while crun-only)
+T3a-runsc	runsc: allocation past 768m is OOM-killed (host-only optional while crun-only)
+T3c-runsc	runsc: fork past 256 pids fails or the sandbox is killed (host-only optional while crun-only)
+T3e-runsc	runsc: scope CPU quota is 100% (host-only optional while crun-only)
+T4a-runsc	runsc: direct egress fails (host-only optional while crun-only)
+T5a-runsc	runsc: proxy CONNECT to an allowlisted host returns 200 (host-only optional while crun-only)
+T5b-runsc	runsc: proxy CONNECT to a non-allowlisted host returns 403 (host-only optional while crun-only)
+T6a-runsc	runsc: Podman socket is not visible (host-only optional while crun-only)
+T6b-runsc	runsc: /home/agentctl is not visible (host-only optional while crun-only)
 H1	agentctl uid is 1000
 H2	sbx uid is 1001
 H3	/home/agentctl/data is mode 0700 and owned by agentctl
 H4	/home/agentctl/secrets is mode 0700 and owned by agentctl
 H5	crun API socket exists
-H6	runsc API socket exists
+H6	runsc API socket exists (host-only optional while crun-only)
 H7	localhost/sandbox-base:1 exists in the crun store
-H8	runsc-rootless wrapper passes --ignore-cgroups
+H8	runsc-rootless wrapper passes --ignore-cgroups (host-only optional while crun-only)
 H9	user-1001.slice MemoryMax is 2600M
 H10	user-1001.slice MemorySwapMax is 512M
 H11	user-1001.slice TasksMax is 2048
@@ -548,6 +548,9 @@ test_T8() {
 test_T9() {
   local runtime url count=0 n
   for runtime in crun runsc; do
+    if [[ "$runtime" == "runsc" && ! -S /run/sbx/podman-runsc.sock ]]; then
+      continue
+    fi
     url="$(socket_for "$runtime")"
     n="$(sbx podman --url "$url" ps -q | wc -l)" || return 1
     n="${n// /}"
@@ -559,6 +562,17 @@ test_T9() {
   fi
 }
 
+# runsc T1–T6 and H6/H8 stay in the catalog. While production is crun-only they are
+# host-only and optional: a failure does not fail the suite, and the checks are not deleted.
+optional_host_only_runsc() {
+  case "$1" in
+    T1a-runsc|T1b-runsc|T1c-runsc|T1d-runsc|T2a-runsc|T2b-runsc|T2c-runsc|T3a-runsc|T3c-runsc|T3e-runsc|T4a-runsc|T5a-runsc|T5b-runsc|T6a-runsc|T6b-runsc|H6|H8)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
 # Sourced by unit tests so they can call one check. Executing the file runs the suite.
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
   return 0
@@ -568,6 +582,7 @@ fi
 # `|| return 1` so an early failure is not replaced by a later success.
 pass=0
 fail=0
+optional=0
 while IFS=$'\t' read -r id _desc; do
   [[ -n "$id" ]] || continue
   fn="test_${id//-/_}"
@@ -576,7 +591,15 @@ while IFS=$'\t' read -r id _desc; do
     fail=$((fail + 1))
     continue
   fi
-  if "$fn"; then
+  if optional_host_only_runsc "$id"; then
+    if "$fn"; then
+      echo "PASS $id"
+      pass=$((pass + 1))
+    else
+      echo "SKIP $id (host-only optional while production is crun-only)"
+      optional=$((optional + 1))
+    fi
+  elif "$fn"; then
     echo "PASS $id"
     pass=$((pass + 1))
   else
@@ -585,5 +608,5 @@ while IFS=$'\t' read -r id _desc; do
   fi
 done <<<"$CATALOG"
 
-echo "$pass passed, $fail failed (max sandboxes=$MAX_SANDBOXES)"
+echo "$pass passed, $fail failed, $optional skipped (host-only runsc checks; max sandboxes=$MAX_SANDBOXES)"
 [[ "$fail" -eq 0 ]]

@@ -18,7 +18,7 @@
 | Node.js | `>= 22.19.0`。systemd 单元里的路径是 `/usr/bin/node`，所以这个路径必须是这个版本 |
 | npm | `>= 11`。本仓库 `packageManager` 是 `npm@11.6.2`。安装依赖用 `npm ci`，不要加 `--legacy-peer-deps` |
 
-另外，controller 读工作区时用宿主上的 `python3` 调 `openat2`（syscall 437）。这是宿主工具，不是镜像里的工具。
+helper 创建会话叶子时用宿主上的 `python3` 调 `openat2`（syscall 437）。这是宿主工具，不是镜像里的工具。会话文件的读、写、列目录、改名、stat 和 flush 不走这条路径，它们在容器里经 exec 完成。
 
 对外只开 SSH（22）。Web 不直接听公网。
 
@@ -55,7 +55,7 @@ done
 
 叶子不在这里创建。下面第 2.1 节的 helper 收到请求后才建 `<session>`，模式 `0700`。不要把 `/home/agentctl`、Podman socket 或 secrets 挂进容器。
 
-crun 的 `--userns keep-id:uid=1000,gid=1000` 在 sbx 的 rootless Podman 里把容器 uid 1000 映到宿主 `sbx`。`0700` 且属主是 `sbx` 的叶子，容器进程能读写。agentctl 不是叶子的属主，父目录 ACL 也没有写，叶子上不加 ACL，所以 controller 进程自己 `open` 这个叶子会得到 `EACCES`。`SandboxExecutionEnv` 的读路径仍是 agentctl 侧的 openat2。这次不把叶子改成 `0777`，也不给 agentctl 加写 ACL。容器里的 exec 走的是容器进程，不受这道宿主叶子权限挡住。
+crun 的 `--userns keep-id:uid=1000,gid=1000` 在 sbx 的 rootless Podman 里把容器 uid 1000 映到宿主 `sbx`。`0700` 且属主是 `sbx` 的叶子，容器进程能读写。叶子保持 `0700`，不加 ACL，也不改成 `0777`。`SandboxExecutionEnv` 的文件操作在容器里经 exec 完成（`cat --`、stdin 上的 `tee`、`ls` / `stat` / `mv`）。路径限制在 `/workspace`，拒绝 `..` 和越出 `/workspace` 的绝对路径，并用 `realpath` 确认目标落在 `/workspace` 下面。agentctl 不在宿主上打开叶子。
 
 ### 2.1 会话叶子 helper
 
@@ -70,9 +70,9 @@ agentctl 只往套接字写一行 JSON：`{"bot":"ops","session":"root"}`。成�
 
 套接字 `/run/sbx/workspace.sock`，`SocketUser=sbx`，`SocketGroup=agentctl`，`SocketMode=0660`。只允许 sbx 和 `agentctl` 组连接。禁止 `0666`、`0662`、`0777` 和 `chmod a+rw`。`/run/sbx` 本身保持 sbx 可进入，不要对其他用户可写。
 
-服务是 `User=sbx`，`NoNewPrivileges=yes`，`ProtectSystem=strict`，`ProtectHome=yes`，`ReadWritePaths=/home/sbx/workspaces`。这行只出现在 helper 单元上。`agentctl-controller.service` 的 `NoNewPrivileges`、`ProtectSystem` 和 `ReadWritePaths` 保持原样，不加入工作区。
+服务是 `User=sbx`，`NoNewPrivileges=yes`，`ProtectSystem=strict`，`ProtectHome=read-only`，`ReadWritePaths=/home/sbx/workspaces`。`ProtectHome=read-only` 让 `/home` 可见但是只读，`ReadWritePaths` 再把工作区树打开。不要改成 `ProtectHome=yes`：那会把 `/home` 藏起来，`ReadWritePaths` 经常加不回去。这行只出现在 helper 单元上。`agentctl-controller.service` 的 `NoNewPrivileges`、`ProtectSystem` 和 `ReadWritePaths` 保持原样，不加入工作区。
 
-脚本放在 `/usr/local/lib`，因为 helper 的 `ProtectHome=yes` 看不到 `/home/agentctl`。安装（在 VPS 上，由操作者执行；先停在第 3 节把代码检出到 `/home/agentctl/app`）：
+脚本放在 `/usr/local/lib`，helper 不依赖 `/home/agentctl` 可写。安装（在 VPS 上，由操作者执行；先停在第 3 节把代码检出到 `/home/agentctl/app`）：
 
 ```bash
 install -d -o root -g root -m 0755 /usr/local/lib/pi-personal-agents
@@ -90,6 +90,24 @@ systemctl enable --now sbx-workspace.socket
 ```
 
 只 enable socket 单元。systemd 在第一次连接时拉起服务。升级 controller 时把 `sbx-workspace.ts` 按上面的 `install` 再复制一次，然后 `systemctl restart sbx-workspace.socket`。
+
+装好后核对 helper 真能在只读的 `/home` 上写出 `0700` 叶子，并且 controller 单元没有因此放宽：
+
+```bash
+systemctl show sbx-workspace.service -p ProtectHome -p ReadWritePaths -p NoNewPrivileges -p ProtectSystem
+python3 - <<'PY'
+import socket
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect("/run/sbx/workspace.sock")
+s.sendall(b'{"bot":"ops","session":"deploy-check"}\n')
+print(s.recv(128).decode())
+PY
+stat -c '%a %U' /home/sbx/workspaces/ops/deploy-check
+systemctl show agentctl-controller.service -p ReadWritePaths -p NoNewPrivileges -p ProtectSystem
+rmdir /home/sbx/workspaces/ops/deploy-check
+```
+
+期望：helper 的 `ProtectHome=read-only`，`ReadWritePaths=/home/sbx/workspaces`，`NoNewPrivileges=yes`，`ProtectSystem=strict`；套接字回答 `{"ok":true}`；叶子是 `700 sbx`；controller 的 `ReadWritePaths` 仍只有 `/home/agentctl/data` 和 `/home/agentctl/secrets`。然后删掉这次核对用的空叶子。
 
 controller 用 `PPA_WORKSPACE_SOCKET`（默认 `/run/sbx/workspace.sock`）请求叶子。这个变量不是秘密，可以写在 `controller.env`，也可以省略。
 
@@ -214,12 +232,14 @@ cd /home/agentctl/app
 npm run test:vps
 ```
 
-这就是 `bash ops/tests/sandbox-env.sh`，一共 48 项：
+这就是 `bash ops/tests/sandbox-env.sh`，目录里仍是 48 项：
 
 - crun 与 runsc 各一组 T1–T6（身份、只读根、内存 / pids / CPU、出网、代理白名单、容器里看不到 Podman socket 和 `/home/agentctl`）
 - H1–H16（用户、目录模式、两个 socket、镜像、runsc wrapper、slice 上限、nft、tinyproxy、工作区权限、symlink / `..` / 硬链接）
 - T8（三个沙箱并发时内存与 sshd）
 - T9（运行中的沙箱不超过 3）
+
+生产只启用 crun 期间，runsc 那一组 T1–T6 以及 H6、H8 是主机专用、可选。脚本仍会执行它们，失败或缺少 runsc 时记为 SKIP，不让整套失败，也不从目录里删掉。重新启用 runsc 之后，这些检查再改回必过。其余项必须通过：crun 的 T1–T6、H1–H5、H7、H9–H16、T8、T9。T9 在 runsc 套接字不存在时只数 crun 的容器。
 
 直接执行这个脚本时（包括只列出名字的 `--list`），下面五个变量只要有一个非空，脚本就以状态 1 退出：
 
@@ -235,7 +255,7 @@ npm run test:vps
 env | grep '^SBX_' || true
 ```
 
-期望没有上面那五个。48 项都通过才算这台机器的沙箱环境可用。CI 不会在 GitHub 上重跑这 48 项。
+期望没有上面那五个。除上面标成可选的 runsc 检查以外，其余项都通过才算这台机器的沙箱环境可用。CI 不会在 GitHub 上重跑这 48 项。
 
 ## 9. 生产只启动 crun
 
@@ -249,7 +269,7 @@ controller 进程里没有 `runuser`，也没有 `systemctl set-property`。crun
 
 `set_runtime` 的参数里仍能写出 `runsc`，这样模型选它时会拿到上面那句拒绝，而不是静默切换。工具实现和 `beforeTool` 都不会把 runtime 记成 runsc。`set_runtime` 仍在危险工具名单里；目标是 `crun` 时仍要审批。
 
-`ops/tests/sandbox-env.sh` 仍会在主机上检查 runsc 那一组 T1–T6 和 H6/H8。那是主机环境脚本，不是 controller 的启动路径。脚本里对 scope 属性的 `|| true` 仍是测试夹具。
+`ops/tests/sandbox-env.sh` 仍列出 runsc 那一组 T1–T6 和 H6/H8。crun-only 期间它们是主机专用、可选，失败记为 SKIP。那是主机环境脚本，不是 controller 的启动路径。脚本里对 scope 属性的 `|| true` 仍是测试夹具。
 
 重新启用 runsc 要先有一条不经过 agentctl `runuser` 的 set-property 路径，并且在 start 之前加上 `MemoryMax=768M`、`TasksMax=256`、`CPUQuota=100%`（`RUNSC_SCOPE_PROPERTIES`）。在那之前 runsc 不可选。见第 12 节。
 
@@ -310,6 +330,6 @@ cloudflared 自身的日志用它的系统单元看（常见是 `journalctl -u c
 
 ### 会话叶子：sbx helper 创建
 
-叶子由 `User=sbx` 的 socket 激活服务创建，模式 `0700`，属主 `sbx`。校验是 openat，拒绝 `..` 和符号链接。agentctl 只发请求。父目录保持 sbx `0750` 加 agentctl 的 `r`/`x` ACL。安装步骤在第 2.1 节。
+叶子由 `User=sbx` 的 socket 激活服务创建，模式 `0700`，属主 `sbx`。校验是 openat，拒绝 `..` 和符号链接。agentctl 只发请求。父目录保持 sbx `0750` 加 agentctl 的 `r`/`x` ACL。安装步骤在第 2.1 节。会话文件的读写在容器内 exec 完成，agentctl 不在宿主上打开叶子，叶子权限和 ACL 都不改。
 
 retry 仍是 `{ enabled: false, maxRetries: 0, baseDelayMs: 0 }`，这项还待确认，和上面两件无关。

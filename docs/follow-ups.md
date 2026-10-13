@@ -44,4 +44,4 @@ Phase 1 评审时记下的后续。沙箱边界保持原样。上下文压缩已
 
 `sbx-workspace.socket` 拉起 `User=sbx` 的服务。它只用 openat 在 `/home/sbx/workspaces/<bot>` 下创建会话叶子，模式 `0700`，属主 sbx。agentctl 只发请求。父目录仍是 sbx `0750` 加 agentctl 的 `r`/`x` ACL。
 
-叶子是 `0700` 而不是早先为 gVisor `nobody` 准备的 `0777`。crun 的 `keep-id:uid=1000,gid=1000` 在 sbx 跑 Podman 时，容器 uid 1000 对应宿主 sbx，所以容器能写这个叶子。agentctl 不能 `open` 它。读路径仍是 controller 侧的 openat2，在这台机器上会 `EACCES`。这是这次模式选择的结果，不把叶子改松，也不给 agentctl 加写 ACL。
+叶子是 `0700`、属主 sbx。crun 的 `keep-id:uid=1000,gid=1000` 在 sbx 跑 Podman 时，容器 uid 1000 对应宿主 sbx，所以容器能写这个叶子。会话文件的读、写、列目录、改名和 flush 都在容器里经 exec 完成（`cat --`、stdin 上的 `tee`、`ls` / `stat` / `mv`）。路径限制在 `/workspace`，拒绝 `..` 和越界绝对路径，`realpath` 必须落在 `/workspace` 下面。不把叶子改松，也不给 agentctl 加 ACL。agentctl 不在宿主上打开叶子。

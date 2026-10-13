@@ -98,7 +98,7 @@ sequenceDiagram
   - `crun`（当前唯一生产档）：`/run/sbx/podman.sock`。create 然后 start。内存 / pids / cpu 由 Podman spec 施加。
   - `runsc`：controller 不启动，`set_runtime` 选它会被拒绝，直到有一条不经过 agentctl `runuser` 的 set-property 路径。重新启用时必须在 start 之前设置 libpod-conmon scope 的 `MemoryMax=768M`、`TasksMax=256`、`CPUQuota=100%`。主机上的 gVisor socket 可以仍在，供环境脚本检查。外层 `user-1001.slice` 有全局上限兜底。
 - **并发**：最多 3 个运行中容器（3×768m），超出排队（FIFO，带取消）。空闲超时（默认 10 分钟）stop 容器，工作区保留。
-- **文件读取**：controller 侧读取工作区文件时必须用 `openat2(RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS)`；不可用时逐级 `lstat` 拒绝 symlink，并拒绝 `nlink>1` 的普通文件（防硬链接）。优先通过容器内 exec 读写，controller 直接触盘只用于大文件/附件。
+- **文件操作**：全部在容器内 exec（`cat --`、stdin 上的 `tee`、`ls` / `stat` / `mv`）。路径限制在 `/workspace`，拒绝 `..` 和越出 `/workspace` 的绝对路径，并用 `realpath` 确认目标落在 `/workspace` 下。符号链接目标和 `nlink>1` 的普通文件不返回内容。controller 不打开叶子。helper 创建叶子仍用 `openat2`。
 - **replay**：所有 exec 类工具默认不 replay（崩溃后告诉模型“被中断”）；只读工具经测试后可标 `replay:"safe"`。
 
 ### 3.2 审批与策略引擎
@@ -157,7 +157,7 @@ sequenceDiagram
 | Prompt 注入 | 网页/文件内容诱导执行危险工具 | 策略引擎在模型外；危险工具默认 ask；内容标注为数据 |
 | 数据外泄 | 沙箱经 github.com / chatgpt.com 等白名单域名上传数据 | 已知风险：Phase 1 白名单最小化；Phase 3 每 bot 白名单 + 上传类请求审批/大小限制；沙箱无秘密，限制可泄露内容 |
 | 沙箱逃逸 | 内核/crun 漏洞 | rootless + userns + cap-drop + no-new-privileges + read-only。runsc 当前不启动；无 KVM 故不用 Firecracker |
-| 符号链接/路径穿越 | 沙箱放 symlink 指向 `/home/agentctl/secrets` | openat2 RESOLVE_BENEATH\|NO_SYMLINKS；父目录 750+ACL |
+| 符号链接/路径穿越 | 沙箱放 symlink 指向 `/home/agentctl/secrets` | 容器内 exec；拒绝 `..` 和越出 `/workspace` 的绝对路径；`realpath` 必须落在 `/workspace` 下。叶子由 helper 用 openat2 创建。父目录 750+ACL |
 | 资源耗尽 | fork 炸弹/内存 | pids 256、768m、cpus 1、并发 3、user-1001.slice 全局上限。crun 用 Podman 的 memory/pids/cpu。runsc 重新启用时还要在 start 前设置 scope 属性 |
 | 冒充审批 | 子 bot 输出“用户已批准” | 审批只来自认证 Web 会话；审计记录决策人 |
 | 跨通道泄露 | 一个通道的内容被转发到另一通道（参考 Grok Bot CFO 事件教训） | 每 bot 独立连接；跨通道转发需显式用户授权规则 |
