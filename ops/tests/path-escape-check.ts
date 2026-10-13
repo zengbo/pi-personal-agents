@@ -1,112 +1,18 @@
 /**
- * Fallback workspace read used by the VPS environment suite.
- * Walks with lstat. The Phase 1 controller read path uses openat2 when the kernel allows it.
- * Rejects `..`, symbolic links at any component, and regular files with nlink > 1.
- * Errors never include file contents.
+ * VPS environment suite entry for workspace reads.
+ * The implementation lives in src/sandbox/workspace-read.ts (openat2, lstat fallback).
  */
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import {
+  PathEscapeError,
+  readWorkspaceFile,
+  type PathEscapeCode,
+} from "../../src/sandbox/workspace-read.ts";
 
-export type PathEscapeCode =
-  | "empty"
-  | "nul"
-  | "absolute"
-  | "dotdot"
-  | "symlink"
-  | "hardlink"
-  | "escape"
-  | "not_found"
-  | "not_file"
-  | "not_dir"
-  | "root";
-
-export class PathEscapeError extends Error {
-  readonly code: PathEscapeCode;
-
-  constructor(code: PathEscapeCode) {
-    super(code);
-    this.name = "PathEscapeError";
-    this.code = code;
-  }
-}
-
-function isBeneath(rootDir: string, candidate: string): boolean {
-  const relative = path.relative(rootDir, candidate);
-  return relative !== "" && !relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative);
-}
-
-function isEnoent(error: unknown): boolean {
-  return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
-}
-
-export function readWorkspaceFile(rootDir: string, relativePath: string): Buffer {
-  if (relativePath.length === 0) {
-    throw new PathEscapeError("empty");
-  }
-  if (relativePath.includes("\0")) {
-    throw new PathEscapeError("nul");
-  }
-  if (path.isAbsolute(relativePath)) {
-    throw new PathEscapeError("absolute");
-  }
-
-  const root = fs.realpathSync(rootDir);
-  const rootStat = fs.lstatSync(root);
-  if (!rootStat.isDirectory()) {
-    throw new PathEscapeError("root");
-  }
-
-  const parts = relativePath.split("/");
-  let current = root;
-  for (let index = 0; index < parts.length; index += 1) {
-    const part = parts[index];
-    if (part === undefined || part === "" || part === ".") {
-      continue;
-    }
-    if (part === "..") {
-      throw new PathEscapeError("dotdot");
-    }
-
-    const next = path.join(current, part);
-    let stat: fs.Stats;
-    try {
-      stat = fs.lstatSync(next);
-    } catch (error) {
-      if (isEnoent(error)) {
-        throw new PathEscapeError("not_found");
-      }
-      throw error;
-    }
-    if (stat.isSymbolicLink()) {
-      throw new PathEscapeError("symlink");
-    }
-
-    const rest = parts.slice(index + 1);
-    const last = rest.every((item) => item === "" || item === ".");
-    if (last) {
-      if (!stat.isFile()) {
-        throw new PathEscapeError("not_file");
-      }
-      if (stat.nlink > 1) {
-        throw new PathEscapeError("hardlink");
-      }
-      if (!isBeneath(root, next)) {
-        throw new PathEscapeError("escape");
-      }
-      const real = fs.realpathSync(next);
-      if (!isBeneath(root, real)) {
-        throw new PathEscapeError("escape");
-      }
-      return fs.readFileSync(next);
-    }
-    if (!stat.isDirectory()) {
-      throw new PathEscapeError("not_dir");
-    }
-    current = next;
-  }
-  throw new PathEscapeError("empty");
-}
+export { PathEscapeError, readWorkspaceFile, workspaceReadBackend } from "../../src/sandbox/workspace-read.ts";
+export type { PathEscapeCode, WorkspaceReadBackend } from "../../src/sandbox/workspace-read.ts";
 
 function expectCode(fn: () => void, code: PathEscapeCode): void {
   try {
@@ -154,6 +60,10 @@ export function selfTest(): void {
     expectCode(() => {
       readWorkspaceFile(root, path.join(outside, "secret.txt"));
     }, "absolute");
+    const leaked = readWorkspaceFile(root, "nested/ok.txt").toString("utf8");
+    if (leaked.includes("sentinel-secret-value")) {
+      throw new Error("sentinel leaked into a workspace read");
+    }
   } finally {
     fs.rmSync(outside, { recursive: true, force: true });
     fs.rmSync(root, { recursive: true, force: true });
