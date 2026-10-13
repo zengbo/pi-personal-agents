@@ -2,8 +2,10 @@ import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import type { Models } from "@earendil-works/pi-ai";
 import {
   AssistantEntry,
+  DEFAULT_COMPACTION_POLICY,
   Harness,
   createRegistry,
+  type CompactionPolicy,
   type Conversation,
   type ConversationId,
   type ConversationView,
@@ -38,6 +40,15 @@ export interface ControllerOptions {
   readonly engine: PolicyEngine;
   readonly login: LoginSession;
   readonly trace?: string[];
+  /** Merged over pi-durable's built-in compaction policy. Tests lower the thresholds. */
+  readonly compaction?: Partial<CompactionPolicy>;
+  /** Test hook. Fired once each harness is open, before extensions are installed. */
+  readonly onHarness?: (bot: BotName, harness: Harness) => void;
+}
+
+/** Built-in pi-durable compaction, with an optional test override. Retry stays off. */
+export function controllerCompaction(override?: Partial<CompactionPolicy>): CompactionPolicy {
+  return { ...DEFAULT_COMPACTION_POLICY, ...override };
 }
 
 export interface RunningController {
@@ -70,7 +81,7 @@ export async function startController(options: ControllerOptions): Promise<Runni
           models: options.modelsFor(bot),
           registry,
           settings: {
-            compaction: { enabled: false },
+            compaction: controllerCompaction(options.compaction),
             retry: { enabled: false, maxRetries: 0, baseDelayMs: 0 },
           },
           env: (target) => {
@@ -87,6 +98,7 @@ export async function startController(options: ControllerOptions): Promise<Runni
         context,
       );
       harnesses.set(bot, harness);
+      options.onHarness?.(bot, harness);
     }
     trace?.push("install");
     const router: DelegateRouter = {

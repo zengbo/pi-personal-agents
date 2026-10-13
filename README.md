@@ -19,11 +19,13 @@
 - [docs/design.md](docs/design.md)：架构、Mermaid 图、安全模型、威胁模型、决策与被否决方案
 - [docs/vps-environment.md](docs/vps-environment.md)：VPS 实测环境与验收测试（45 PASS / 3 FAIL 及修复）
 - [docs/implementation-plan.md](docs/implementation-plan.md)：分阶段实施计划与验收标准
+- [docs/phase-1.md](docs/phase-1.md)：Phase 1 落地的公共边界
+- [docs/deployment.md](docs/deployment.md)：在 VPS 上部署 controller 的步骤
 - [AGENTS.md](AGENTS.md)：给编码 Agent 的规则
 
 ## 状态
 
-Phase 0 已合并。Phase 1（controller、Web、三个 bot、Podman 沙箱、审批）在分支上实现，见 [docs/phase-1.md](docs/phase-1.md)。设计文档仍是规格；VPS 上的 48 项环境测试不在 CI 里重跑，也不从这里登录 `racknerd_us`。
+Phase 0 已合并（`39774a1`）。Phase 1（controller、Web、三个 bot、Podman 沙箱、审批）已合并到 main（`f50f652`）。bot 对话使用 pi-durable 1.1.0 的内置上下文压缩；retry 仍关闭。部署步骤见 [docs/deployment.md](docs/deployment.md)。设计文档仍是规格；VPS 上的 48 项环境测试不在 CI 里重跑，也不从这里登录 `racknerd_us`。
 
 ## 依赖版本（精确锁定）
 
